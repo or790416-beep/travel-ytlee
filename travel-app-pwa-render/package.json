@@ -1,0 +1,13 @@
+{
+  "name": "travel-itinerary-pwa",
+  "version": "6.14.0",
+  "private": true,
+  "description": "可安裝的旅遊行程 PWA",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js && node server.test.js && node pwa.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
