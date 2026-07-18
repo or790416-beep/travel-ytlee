@@ -401,12 +401,12 @@ assert.equal(api.deletePackingItem("missing"), false);
 assert.equal(alertMessages.at(-1), "找不到這筆打包項目，請重新開啟明細。");
 assert.equal(alertMessages.length, alertsBeforeMissing + 1);
 api.state.syncSettings = null;
-assert.match(styles, /\.reference-card-list\s*\{[\s\S]*?row-gap:\s*6px;[\s\S]*?margin:\s*0;[\s\S]*?padding:\s*0;/);
+assert.match(styles, /\.reference-card-list\s*\{[\s\S]*?row-gap:\s*4px;[\s\S]*?margin:\s*0;[\s\S]*?padding:\s*0;/);
 assert.match(styles, /\.reference-card-list > \*\s*\{\s*margin-block:\s*0;/);
 const spacingPatch = styles.slice(styles.indexOf("/* v6-ui-14-sync-2"));
 assert.doesNotMatch(spacingPatch, /\.reference-card\.preview-card-shell|\.reference-preview-main|\.reference-copy|\.preview-media|\.card-corner-actions/);
 console.log("PASS packing 明細刪除：type=button、重繪代理、取消安全、數字／字串 ID、保存與同步排程");
-console.log("PASS 網址卡清單 row-gap 6px，卡片本體樣式未修改");
+console.log("PASS 網址卡清單 row-gap 4px，卡片本體樣式未修改");
 
 let spoken = [];
 let cancelled = 0;
