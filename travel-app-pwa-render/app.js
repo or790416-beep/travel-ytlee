@@ -464,6 +464,7 @@ const state = {
   tripEditScrollTop: 0,
   installDialogOpen: false,
   pwaUpdateReady: false,
+  packingDialog: null,
   syncSettings: loadSyncSettings(),
   syncStatus: loadSyncSettings() ? "idle" : "local",
   syncDialog: null,
@@ -481,10 +482,12 @@ if (!modalRoot) {
 }
 [app, modalRoot].forEach((root) => {
   root.addEventListener("pointerdown", (event) => {
-    if (event.target.closest("[data-packing-item-id]")) event.stopPropagation();
+    if (event.target.closest("[data-packing-action], [data-menu-packing-manager], [data-menu-packing-category-id], [data-close-packing-dialog]")) event.stopPropagation();
   });
-  root.addEventListener("click", handlePackingDetailAction);
+  root.addEventListener("click", handlePackingManagementClick);
 });
+modalRoot.addEventListener("submit", handlePackingDialogSubmit);
+app.addEventListener("change", handlePackingChange);
 
 function render() {
   commitActiveEdit();
@@ -513,7 +516,7 @@ function render() {
       ${renderSyncStatus()}
     </div>
   `;
-  modalRoot.innerHTML = `${renderModal()}${renderFlightDetailModal()}${renderCollectionDetailModal()}${renderCollectionPanel()}${renderTripSelectorDialog()}${renderEditModal()}${renderMobileActionSheet()}${renderInstallDialog()}${renderSyncDialog()}<input type="file" id="trip-backup-input" accept="application/json,.json" hidden />`;
+  modalRoot.innerHTML = `${renderModal()}${renderFlightDetailModal()}${renderCollectionDetailModal()}${renderCollectionPanel()}${renderTripSelectorDialog()}${renderEditModal()}${renderMobileActionSheet()}${renderPackingDialog()}${renderInstallDialog()}${renderSyncDialog()}<input type="file" id="trip-backup-input" accept="application/json,.json" hidden />`;
   bindEvents();
   openRootDialogs();
   openMobileActionSheet();
@@ -1101,7 +1104,7 @@ function renderPacking() {
   const done = all.filter((item) => item.done).length;
   const percent = all.length ? Math.round((done / all.length) * 100) : 0;
   return `
-    <h2 class="section-title">行李打包清單</h2>
+    <div class="packing-heading"><h2 class="section-title">行李打包清單</h2><div class="item-menu"><button class="menu-button" type="button" data-menu-packing-manager aria-label="管理打包清單項目欄">⋯</button>${state.openMenuId === "packing-manager" ? '<div class="menu-popover inline-popover"><button type="button" data-packing-action="add-category">新增項目欄</button><button type="button" data-packing-action="delete-category">刪除項目欄</button></div>' : ""}</div></div>
     <div class="progress-wrap">
       <div class="progress-label"><span>已打包 ${done} / ${all.length}</span><span>${percent}%</span></div>
       <div class="progress-track"><div class="progress-bar" style="width:${percent}%"></div></div>
@@ -1110,19 +1113,16 @@ function renderPacking() {
       ${all.length ? "" : '<p class="placeholder">尚無打包項目。</p>'}
       ${state.trip.packing
         .map(
-          (group) => `
+          (group, groupIndex) => `
             <section class="packing-category">
-              <h3>${escapeHtml(group.category)}</h3>
+              <div class="packing-category-heading"><h3>${escapeHtml(group.category)}</h3><div class="item-menu"><button class="menu-button" type="button" data-menu-packing-category-id="${escapeAttr(packingGroupIdentity(group, groupIndex))}" aria-label="管理項目欄：${escapeAttr(group.category)}">⋯</button>${state.openMenuId === `packing-category:${packingGroupIdentity(group, groupIndex)}` ? `<div class="menu-popover inline-popover"><button type="button" data-packing-action="add-item" data-packing-category-id="${escapeAttr(packingGroupIdentity(group, groupIndex))}">新增子項目</button><button type="button" data-packing-action="delete-item" data-packing-category-id="${escapeAttr(packingGroupIdentity(group, groupIndex))}">刪除子項目</button><button type="button" data-packing-action="rename-category" data-packing-category-id="${escapeAttr(packingGroupIdentity(group, groupIndex))}">重新命名項目欄</button></div>` : ""}</div></div>
+              ${group.items.length ? "" : '<p class="placeholder">尚無打包項目。</p>'}
               ${group.items
                 .map(
                   (item) => `
                     <div class="check-row">
                       <input id="pack-${escapeAttr(item.id)}" type="checkbox" data-pack-id="${escapeAttr(item.id)}" ${item.done ? "checked" : ""} />
                       <label for="pack-${escapeAttr(item.id)}" class="${item.done ? "done" : ""}">${escapeHtml(item.name)}</label>
-                      <div class="item-menu">
-                        <button class="menu-button" type="button" data-menu-pack-id="${escapeAttr(item.id)}" aria-label="更多操作：${escapeAttr(item.name)}">⋯</button>
-                        ${state.openMenuId === `pack:${item.id}` ? `<div class="menu-popover inline-popover"><button class="danger-menu-item" type="button" data-packing-item-id="${escapeAttr(item.id)}" aria-label="刪除 ${escapeAttr(item.name)}">刪除項目</button></div>` : ""}
-                      </div>
                     </div>
                   `
                 )
@@ -1131,10 +1131,6 @@ function renderPacking() {
           `
         )
         .join("")}
-    </div>
-    <div class="panel add-row">
-      <input class="text-input" id="new-pack-item" type="text" placeholder="新增自定義項目" />
-      <button class="primary-button" id="add-pack-item">新增</button>
     </div>
   `;
 }
@@ -1293,17 +1289,34 @@ function renderUndoToast() {
 
 function renderMobileActionSheet() {
   if (!state.openMenuId) return "";
-  const [type, id] = state.openMenuId.split(":");
+  const [type, ...idParts] = state.openMenuId.split(":");
+  const id = idParts.join(":");
   let actions = "";
   if (type === "timeline") actions = `<button type="button" data-edit-timeline-id="${escapeAttr(id)}">編輯行程</button><button type="button" data-insert-timeline-above="${escapeAttr(id)}">在上方新增行程</button><button type="button" data-add-flight-for="${escapeAttr(id)}">新增航班資訊</button><button type="button" data-add-reference-for="${escapeAttr(id)}">新增旅遊網址</button><button class="sheet-danger" type="button" data-delete-timeline-id="${escapeAttr(id)}">刪除行程</button>`;
   if (type === "flight") actions = `<button type="button" data-edit-flight-modal-id="${escapeAttr(id)}">編輯航班資訊</button><button class="sheet-danger" type="button" data-delete-flight-id="${escapeAttr(id)}">刪除航班資訊</button>`;
   if (type === "reference") actions = `<button type="button" data-edit-reference-modal-id="${escapeAttr(id)}">編輯網址</button><button class="sheet-danger" type="button" data-delete-reference-id="${escapeAttr(id)}">刪除網址</button>`;
   if (type === "booking") actions = `<button class="sheet-danger" type="button" data-delete-booking-id="${escapeAttr(id)}">刪除待辦事項</button>`;
-  if (type === "pack") actions = `<button class="sheet-danger" type="button" data-packing-item-id="${escapeAttr(id)}">刪除項目</button>`;
+  if (type === "packing-manager") actions = `<button type="button" data-packing-action="add-category">新增項目欄</button><button class="sheet-danger" type="button" data-packing-action="delete-category">刪除項目欄</button>`;
+  if (type === "packing-category") actions = `<button type="button" data-packing-action="add-item" data-packing-category-id="${escapeAttr(id)}">新增子項目</button><button class="sheet-danger" type="button" data-packing-action="delete-item" data-packing-category-id="${escapeAttr(id)}">刪除子項目</button><button type="button" data-packing-action="rename-category" data-packing-category-id="${escapeAttr(id)}">重新命名項目欄</button>`;
   if (type === "lodging" || type === "dining") actions = `<button type="button" data-edit-collection="${escapeAttr(id)}" data-collection-type="${type}">編輯</button><button class="sheet-danger" type="button" data-delete-collection="${escapeAttr(id)}" data-collection-type="${type}">刪除</button>`;
   if (type === "trip-manager") actions = renderTripManagerActions().replace('id="delete-trip"', 'class="sheet-danger" id="delete-trip"').replace('<button type="button" data-close-trip-menu>取消</button>', '');
   if (!actions) return "";
   return `<dialog class="mobile-action-sheet" id="mobile-action-sheet" aria-label="項目操作"><div class="sheet-handle"></div>${actions}<button class="sheet-cancel" type="button" data-close-action-sheet>取消</button></dialog>`;
+}
+
+function renderPackingDialog() {
+  const dialog = state.packingDialog;
+  if (!dialog) return "";
+  const found = dialog.categoryId === undefined ? null : findPackingGroup(dialog.categoryId);
+  const close = '<button class="secondary-button" type="button" data-close-packing-dialog>取消</button>';
+  const shell = (title, body) => `<div class="modal-backdrop"><form class="modal packing-dialog" data-packing-dialog-form="${escapeAttr(dialog.type)}"><div class="modal-header"><h2>${escapeHtml(title)}</h2>${close}</div><div class="modal-body edit-form-grid">${body}</div></form></div>`;
+  if (dialog.type === "add-category") return shell("新增項目欄", `<label>項目欄名稱<input class="text-input" name="name" required autofocus></label><div class="form-actions"><button class="primary-button" type="submit">新增</button>${close}</div>`);
+  if (dialog.type === "delete-category") return shell("刪除項目欄", `<label>選擇項目欄<select class="text-input" name="targetId" required>${state.trip.packing.map((group, index) => `<option value="${escapeAttr(packingGroupIdentity(group, index))}">${escapeHtml(group.category)}</option>`).join("")}</select></label>${state.trip.packing.length ? `<div class="form-actions"><button class="danger-button" type="submit">刪除項目欄</button>${close}</div>` : '<p class="placeholder">目前沒有可刪除的項目欄。</p>'}`);
+  if (!found) return shell("打包清單", `<p class="alert">找不到這個打包項目欄，請重新開啟。</p>${close}`);
+  if (dialog.type === "add-item") return shell("新增子項目", `<input type="hidden" name="categoryId" value="${escapeAttr(dialog.categoryId)}"><label>子項目名稱<input class="text-input" name="name" required autofocus></label><div class="form-actions"><button class="primary-button" type="submit">新增</button>${close}</div>`);
+  if (dialog.type === "delete-item") return shell("刪除子項目", `<input type="hidden" name="categoryId" value="${escapeAttr(dialog.categoryId)}"><label>選擇子項目<select class="text-input" name="itemId" required>${found.group.items.map((item) => `<option value="${escapeAttr(item.id)}">${escapeHtml(item.name)}</option>`).join("")}</select></label>${found.group.items.length ? `<div class="form-actions"><button class="danger-button" type="submit">刪除子項目</button>${close}</div>` : '<p class="placeholder">目前沒有可刪除的子項目。</p>'}`);
+  if (dialog.type === "rename-category") return shell("重新命名項目欄", `<input type="hidden" name="categoryId" value="${escapeAttr(dialog.categoryId)}"><label>項目欄名稱<input class="text-input" name="name" value="${escapeAttr(found.group.category)}" required autofocus></label><div class="form-actions"><button class="primary-button" type="submit">儲存</button>${close}</div>`);
+  return "";
 }
 
 function openMobileActionSheet() {
@@ -1508,7 +1521,6 @@ function bindEvents() {
     });
   });
 
-  bindPackingEvents();
   bindBookingEvents();
   bindExchangeEvents();
 
@@ -1517,7 +1529,7 @@ function bindEvents() {
 
 function closeOpenActions(event) {
   if (!state.openMenuId) return;
-  if (event.target.closest(".timeline-row, .inline-card, .check-row, .menu-popover")) return;
+  if (event.target.closest(".timeline-row, .inline-card, .check-row, .menu-popover, [data-menu-packing-manager], [data-menu-packing-category-id]")) return;
   state.openMenuId = null;
   render();
 }
@@ -1596,40 +1608,44 @@ async function fetchLinkPreviewForInput(input) {
   }
 }
 
-function bindPackingEvents() {
-  document.querySelectorAll("[data-pack-id]").forEach((checkbox) => {
-    checkbox.addEventListener("change", () => {
-      const item = findPackingItem(checkbox.dataset.packId)?.item;
-      if (!item) return;
-      item.done = checkbox.checked;
-      saveTrip();
-      render();
-    });
-  });
-
-  document.querySelectorAll("[data-menu-pack-id]").forEach((button) => {
-    button.addEventListener("pointerdown", (event) => event.stopPropagation());
-    button.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const id = button.dataset.menuPackId;
-      state.openMenuId = state.openMenuId === `pack:${id}` ? null : `pack:${id}`;
-      render();
-    });
-  });
-
-  document.querySelector("#add-pack-item")?.addEventListener("click", addCustomPackingItem);
-  document.querySelector("#new-pack-item")?.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") addCustomPackingItem();
-  });
+function handlePackingChange(event) {
+  const checkbox = event.target.closest("[data-pack-id]");
+  if (!checkbox) return;
+  const found = findPackingItem(checkbox.dataset.packId);
+  if (!found) { alert("找不到這筆打包項目，請重新開啟。"); return; }
+  found.item.done = checkbox.checked;
+  saveTrip();
+  render();
 }
 
-function handlePackingDetailAction(event) {
-  const deleteButton = event.target.closest("[data-packing-item-id]");
-  if (!deleteButton) return;
+function handlePackingManagementClick(event) {
+  const manager = event.target.closest("[data-menu-packing-manager]");
+  const categoryMenu = event.target.closest("[data-menu-packing-category-id]");
+  const action = event.target.closest("[data-packing-action]");
+  const close = event.target.closest("[data-close-packing-dialog]");
+  if (!manager && !categoryMenu && !action && !close) return;
   event.preventDefault();
   event.stopPropagation();
-  deletePackingItem(deleteButton.dataset.packingItemId);
+  if (close) { state.packingDialog = null; render(); return; }
+  if (manager) { state.openMenuId = "packing-manager"; render(); return; }
+  if (categoryMenu) { state.openMenuId = `packing-category:${categoryMenu.dataset.menuPackingCategoryId}`; render(); return; }
+  state.packingDialog = { type: action.dataset.packingAction, categoryId: action.dataset.packingCategoryId };
+  state.openMenuId = null;
+  render();
+}
+
+function handlePackingDialogSubmit(event) {
+  const form = event.target.closest("[data-packing-dialog-form]");
+  if (!form) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const data = new FormData(form);
+  const type = form.dataset.packingDialogForm;
+  if (type === "add-category") addPackingGroup(data.get("name"));
+  if (type === "delete-category") deletePackingGroup(data.get("targetId"));
+  if (type === "add-item") addPackingChild(data.get("categoryId"), data.get("name"));
+  if (type === "delete-item") deletePackingChild(data.get("categoryId"), data.get("itemId"));
+  if (type === "rename-category") renamePackingGroup(data.get("categoryId"), data.get("name"));
 }
 
 function bindBookingEvents() {
@@ -2243,6 +2259,81 @@ function findPackingItem(id) {
     if (index !== -1) return { group, index, item: group.items[index] };
   }
   return null;
+}
+
+function packingGroupIdentity(group, index) {
+  return group.id ?? index;
+}
+
+function findPackingGroup(targetId) {
+  const index = state.trip.packing.findIndex((group, groupIndex) => String(packingGroupIdentity(group, groupIndex)) === String(targetId));
+  return index === -1 ? null : { group: state.trip.packing[index], index };
+}
+
+function validPackingGroupName(name, exceptIndex = -1) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) { alert("項目欄名稱不得為空。"); return ""; }
+  if (state.trip.packing.some((group, index) => index !== exceptIndex && group.category === trimmed)) { alert("已有相同名稱的項目欄。"); return ""; }
+  return trimmed;
+}
+
+function finishPackingChange() {
+  state.packingDialog = null;
+  state.openMenuId = null;
+  saveTrip();
+  render();
+}
+
+function addPackingGroup(name) {
+  const category = validPackingGroupName(name);
+  if (!category) return false;
+  const group = { id: createId(), category, items: [] };
+  state.trip.packing.push(group);
+  finishPackingChange();
+  return group;
+}
+
+function deletePackingGroup(targetId) {
+  const found = findPackingGroup(targetId);
+  if (!found) { alert("找不到這個打包項目欄，請重新開啟。"); return false; }
+  if (!confirm(`確定刪除「${found.group.category}」嗎？\n此項目欄中的所有子項目也會一併刪除。`)) return false;
+  state.trip.packing.splice(found.index, 1);
+  finishPackingChange();
+  return true;
+}
+
+function addPackingChild(categoryId, name) {
+  const found = findPackingGroup(categoryId);
+  if (!found) { alert("找不到這個打包項目欄，請重新開啟。"); return false; }
+  const trimmed = String(name || "").trim();
+  if (!trimmed) { alert("子項目名稱不得為空。"); return false; }
+  const item = { id: createId(), name: trimmed, done: false };
+  found.group.items.push(item);
+  finishPackingChange();
+  return item;
+}
+
+function deletePackingChild(categoryId, itemId) {
+  const found = findPackingGroup(categoryId);
+  if (!found) { alert("找不到這個打包項目欄，請重新開啟。"); return false; }
+  const index = found.group.items.findIndex((item) => String(item.id) === String(itemId));
+  if (index === -1) { alert("找不到這筆打包項目，請重新開啟。"); return false; }
+  const item = found.group.items[index];
+  if (!confirm(`確定刪除「${item.name}」嗎？`)) return false;
+  found.group.items.splice(index, 1);
+  finishPackingChange();
+  return true;
+}
+
+function renamePackingGroup(categoryId, name) {
+  const found = findPackingGroup(categoryId);
+  if (!found) { alert("找不到這個打包項目欄，請重新開啟。"); return false; }
+  const category = validPackingGroupName(name, found.index);
+  if (!category) return false;
+  if (category === found.group.category) { state.packingDialog = null; render(); return true; }
+  found.group.category = category;
+  finishPackingChange();
+  return true;
 }
 
 function deletePackingItem(id) {

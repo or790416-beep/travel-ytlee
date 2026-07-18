@@ -1781,8 +1781,16 @@ a,
 .danger-menu-item { color: #a51d38 !important; }
 .reference-card-list {
   display: grid;
-  row-gap: 2px;
+  row-gap: 1px;
   margin: 0;
   padding: 0;
 }
 .reference-card-list > * { margin-block: 0; }
+.packing-heading,
+.packing-category-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.packing-heading .section-title,
+.packing-category-heading h3 { margin-right: auto; }
+.packing-heading .menu-button,
+.packing-category-heading .menu-button { width: 38px; min-width: 38px; min-height: 38px; }
+.packing-category-heading { margin-bottom: 8px; }
+.packing-category-heading h3 { margin-block: 0; }
