@@ -3,6 +3,7 @@ services:
     name: travel-itinerary-pwa
     runtime: node
     plan: free
+    rootDir: travel-app-pwa-render
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /
