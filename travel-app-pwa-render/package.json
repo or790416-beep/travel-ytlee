@@ -5,7 +5,10 @@
   "description": "可安裝的旅遊行程 PWA",
   "scripts": {
     "start": "node server.js",
-    "test": "node test.js && node server.test.js && node pwa.test.js"
+    "test": "node test.js && node server.test.js && node sync.test.js && node pwa.test.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.52.1"
   },
   "engines": {
     "node": ">=18"

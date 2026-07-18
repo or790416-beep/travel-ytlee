@@ -1,4 +1,5 @@
 const STORAGE_KEY = "fukuoka-hiroshima-trip-v1";
+const SYNC_STORAGE_KEY = "travel-app-cloud-sync-v1";
 const SCHEMA_VERSION = 6;
 const PHRASE_CATEGORIES = ["restaurant", "hotel", "transport", "shopping", "emergency", "general"];
 let storageWarning = "";
@@ -7,6 +8,9 @@ const debouncedPreviewFetch = debounce((input) => fetchLinkPreviewForInput(input
 let deferredInstallPrompt = null;
 let serviceWorkerRegistration = null;
 let pwaReloadPending = false;
+let applyingRemote = false;
+let syncUploadTimer = null;
+let syncInFlight = false;
 
 const transportModes = [
   { value: "", label: "未設定", icon: "" },
@@ -426,6 +430,7 @@ function saveTrip() {
   state.root.schemaVersion = SCHEMA_VERSION;
   state.root.activeTripId = state.trip.id;
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state.root));
+  if (!applyingRemote) scheduleSyncUpload();
 }
 
 const loadedRoot = loadTrip();
@@ -459,6 +464,12 @@ const state = {
   tripEditScrollTop: 0,
   installDialogOpen: false,
   pwaUpdateReady: false,
+  syncSettings: loadSyncSettings(),
+  syncStatus: loadSyncSettings() ? "idle" : "local",
+  syncDialog: null,
+  syncConflict: null,
+  syncMessage: "",
+  syncDirty: false,
 };
 
 const app = document.querySelector("#app");
@@ -493,9 +504,10 @@ function render() {
       </main>
       ${renderUndoToast()}
       ${renderPwaUpdateToast()}
+      ${renderSyncStatus()}
     </div>
   `;
-  modalRoot.innerHTML = `${renderModal()}${renderFlightDetailModal()}${renderCollectionDetailModal()}${renderCollectionPanel()}${renderTripSelectorDialog()}${renderEditModal()}${renderMobileActionSheet()}${renderInstallDialog()}<input type="file" id="trip-backup-input" accept="application/json,.json" hidden />`;
+  modalRoot.innerHTML = `${renderModal()}${renderFlightDetailModal()}${renderCollectionDetailModal()}${renderCollectionPanel()}${renderTripSelectorDialog()}${renderEditModal()}${renderMobileActionSheet()}${renderInstallDialog()}${renderSyncDialog()}<input type="file" id="trip-backup-input" accept="application/json,.json" hidden />`;
   bindEvents();
   openRootDialogs();
   openMobileActionSheet();
@@ -528,6 +540,7 @@ function renderTripManagerActions() {
     ${isStandaloneMode() ? "" : '<button type="button" data-install-app>安裝到手機</button>'}
     <button type="button" data-export-trip-data>備份資料</button>
     <button type="button" data-import-trip-data>匯入備份</button>
+    ${state.syncSettings ? '<button type="button" data-sync-now>立即同步</button><button type="button" data-sync-info>顯示同步資訊</button><button type="button" data-sync-stop>停止此裝置同步</button>' : '<button type="button" data-sync-enable>啟用跨裝置同步</button><button type="button" data-sync-join>加入既有同步</button>'}
     <button type="button" data-close-trip-menu>取消</button>
   `;
 }
@@ -546,6 +559,170 @@ function renderInstallDialog() {
 function renderPwaUpdateToast() {
   if (!state.pwaUpdateReady) return "";
   return `<div class="pwa-update-toast" role="status"><span>旅遊 APP 有新版可用</span><button type="button" data-apply-pwa-update>重新載入</button></div>`;
+}
+
+function loadSyncSettings() {
+  try {
+    const value = JSON.parse(localStorage.getItem(SYNC_STORAGE_KEY) || "null");
+    return value?.syncId && value?.syncSecret && Number.isInteger(value.revision) ? value : null;
+  } catch { return null; }
+}
+
+function saveSyncSettings(settings) {
+  state.syncSettings = settings;
+  if (settings) localStorage.setItem(SYNC_STORAGE_KEY, JSON.stringify(settings));
+  else localStorage.removeItem(SYNC_STORAGE_KEY);
+}
+
+function syncStatusText() {
+  return { local: "僅儲存在此裝置", syncing: "正在同步", synced: "已同步", offline: "離線，稍後同步", conflict: "雲端有衝突", failed: "同步失敗", idle: "已同步" }[state.syncStatus] || "僅儲存在此裝置";
+}
+
+function renderSyncStatus() {
+  return `<div class="sync-status sync-${escapeAttr(state.syncStatus)}" role="status"><span aria-hidden="true"></span>${escapeHtml(syncStatusText())}</div>`;
+}
+
+function encodeSyncCredentials(settings) {
+  const bytes = new TextEncoder().encode(JSON.stringify({ syncId: settings.syncId, syncSecret: settings.syncSecret }));
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function decodeSyncCredentials(value) {
+  const input = String(value || "").trim();
+  let encoded = input;
+  try { encoded = new URL(input, location.href).searchParams.get("sync") || input; } catch {}
+  const padded = encoded.replaceAll("-", "+").replaceAll("_", "/") + "===".slice((encoded.length + 3) % 4);
+  const binary = atob(padded);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function currentSyncLink() {
+  if (!state.syncSettings) return "";
+  const url = new URL(location.href);
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set("sync", encodeSyncCredentials(state.syncSettings));
+  return url.href;
+}
+
+function renderSyncDialog() {
+  if (state.syncConflict) return `<div class="modal-backdrop"><section class="modal sync-dialog" role="dialog" aria-modal="true"><div class="modal-header"><h2>另一部裝置已有較新的修改</h2></div><div class="modal-body"><p>請選擇要保留哪一份資料。系統不會自動覆蓋。</p><div class="form-actions sync-actions"><button class="primary-button" type="button" data-conflict-remote>使用雲端版本</button><button class="danger-button" type="button" data-conflict-local>以此裝置版本覆蓋雲端</button><button class="secondary-button" type="button" data-conflict-cancel>取消，稍後處理</button></div></div></section></div>`;
+  if (!state.syncDialog) return "";
+  if (state.syncDialog === "join") return `<div class="modal-backdrop"><form class="modal sync-dialog" id="sync-join-form"><div class="modal-header"><h2>加入既有同步</h2><button class="secondary-button" type="button" data-sync-close>取消</button></div><div class="modal-body edit-form-grid"><label>同步連結<textarea class="text-input" name="link" placeholder="貼上含有 ?sync= 的同步連結"></textarea></label><p class="placeholder">或輸入同步代碼和同步密鑰</p><label>同步代碼<input class="text-input" name="syncId" autocomplete="off"></label><label>同步密鑰<input class="text-input" name="syncSecret" type="password" autocomplete="off"></label><div class="form-actions"><button class="primary-button" type="submit">先下載並加入</button><button class="secondary-button" type="button" data-sync-close>取消</button></div></div></form></div>`;
+  const link = currentSyncLink();
+  return `<div class="modal-backdrop"><section class="modal sync-dialog" role="dialog" aria-modal="true"><div class="modal-header"><h2>跨裝置同步資訊</h2><button class="secondary-button" type="button" data-sync-close>關閉</button></div><div class="modal-body"><p class="sync-warning">取得此連結的人可以查看及修改行程，請勿公開分享。</p><label>同步連結<textarea class="text-input sync-link" readonly>${escapeHtml(link)}</textarea></label><div class="form-actions"><button class="primary-button" type="button" data-copy-sync-link>複製同步連結</button><button class="secondary-button" type="button" data-sync-close>關閉</button></div><p class="placeholder">同步代碼：${escapeHtml(state.syncSettings?.syncId || "")}</p></div></section></div>`;
+}
+
+async function syncFetch(path, options = {}) {
+  const response = await fetch(path, { ...options, headers: { "Content-Type": "application/json", ...(options.headers || {}) }, cache: "no-store" });
+  const body = await response.json().catch(() => ({}));
+  return { response, body };
+}
+
+function scheduleSyncUpload() {
+  if (!state?.syncSettings || applyingRemote) return;
+  state.syncDirty = true;
+  clearTimeout(syncUploadTimer);
+  syncUploadTimer = setTimeout(() => uploadSync(), 800);
+}
+
+function updateSyncRevision(revision, updatedAt) {
+  saveSyncSettings({ ...state.syncSettings, revision, lastSyncedAt: updatedAt || new Date().toISOString() });
+}
+
+async function enableCloudSync() {
+  state.openMenuId = null;
+  if (!confirm("將此手機的目前行程建立為雲端版本")) { render(); return; }
+  state.syncStatus = "syncing"; render();
+  try {
+    const status = await syncFetch("/api/sync/status");
+    if (!status.body.enabled) throw new Error("伺服器尚未啟用同步");
+    const { response, body } = await syncFetch("/api/sync/create", { method: "POST", body: JSON.stringify({ payload: state.root }) });
+    if (!response.ok) throw new Error("無法建立同步");
+    saveSyncSettings({ syncId: body.syncId, syncSecret: body.syncSecret, revision: body.revision, lastSyncedAt: body.updatedAt });
+    state.syncDirty = false; state.syncStatus = "synced"; state.syncDialog = "info"; render();
+  } catch (error) { state.syncStatus = navigator.onLine === false ? "offline" : "failed"; alert(error.message || "無法建立同步"); render(); }
+}
+
+function applyRemotePayload(payload, revision, updatedAt) {
+  if (!payload || payload.schemaVersion !== 6 || !Array.isArray(payload.trips)) throw new Error("雲端資料格式不正確");
+  applyingRemote = true;
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    state.root = payload;
+    state.trip = payload.trips.find((trip) => trip.id === payload.activeTripId) || payload.trips[0];
+    state.selectedDayId = state.trip?.days?.[0]?.id || null;
+    updateSyncRevision(revision, updatedAt);
+    state.syncDirty = false;
+  } finally { applyingRemote = false; }
+}
+
+async function downloadSync({ joining = false, credentials = state.syncSettings } = {}) {
+  if (!credentials || syncInFlight) return;
+  syncInFlight = true; state.syncStatus = "syncing"; render();
+  try {
+    const { response, body } = await syncFetch(`/api/sync/${encodeURIComponent(credentials.syncId)}`, { headers: { Authorization: `Bearer ${credentials.syncSecret}` } });
+    if (!response.ok) throw new Error(response.status === 404 ? "同步代碼或密鑰不正確" : "下載同步資料失敗");
+    if (joining) {
+      if (!confirm("此裝置已有行程。要使用雲端資料並先自動備份本機資料嗎？")) { state.syncStatus = state.syncSettings ? "idle" : "local"; render(); return; }
+      localStorage.setItem(`${STORAGE_KEY}-before-cloud-${Date.now()}`, JSON.stringify(state.root));
+      saveSyncSettings({ syncId: credentials.syncId, syncSecret: credentials.syncSecret, revision: body.revision, lastSyncedAt: body.updatedAt });
+    } else if (body.revision <= credentials.revision) { state.syncStatus = "synced"; return; }
+    else if (state.syncDirty) { state.syncConflict = { remoteRevision: body.revision, remotePayload: body.payload, updatedAt: body.updatedAt }; state.syncStatus = "conflict"; render(); return; }
+    applyRemotePayload(body.payload, body.revision, body.updatedAt);
+    state.syncDialog = null; state.syncStatus = "synced"; render();
+  } catch (error) { state.syncStatus = navigator.onLine === false ? "offline" : "failed"; if (joining) alert(error.message); render(); }
+  finally { syncInFlight = false; }
+}
+
+async function uploadSync(baseRevision = state.syncSettings?.revision, forced = false) {
+  if (!state.syncSettings || syncInFlight || (!state.syncDirty && !forced)) return;
+  syncInFlight = true; state.syncStatus = "syncing"; render();
+  try {
+    const { response, body } = await syncFetch(`/api/sync/${encodeURIComponent(state.syncSettings.syncId)}`, { method: "PUT", headers: { Authorization: `Bearer ${state.syncSettings.syncSecret}` }, body: JSON.stringify({ payload: state.root, baseRevision }) });
+    if (response.status === 409) { state.syncConflict = body; state.syncStatus = "conflict"; render(); return; }
+    if (!response.ok) throw new Error("上傳同步資料失敗");
+    updateSyncRevision(body.revision, body.updatedAt); state.syncDirty = false; state.syncConflict = null; state.syncStatus = "synced"; render();
+  } catch { state.syncStatus = navigator.onLine === false ? "offline" : "failed"; render(); }
+  finally { syncInFlight = false; }
+}
+
+async function joinCloudSync(form) {
+  const data = new FormData(form);
+  try {
+    const credentials = data.get("link")?.trim() ? decodeSyncCredentials(data.get("link")) : { syncId: data.get("syncId")?.trim(), syncSecret: data.get("syncSecret")?.trim() };
+    await downloadSync({ joining: true, credentials });
+  } catch { alert("同步連結格式不正確"); }
+}
+
+async function syncNow() {
+  await downloadSync();
+  if (!state.syncConflict) await uploadSync();
+}
+
+function stopCloudSync() {
+  if (!confirm("停止後，此裝置仍會保留目前行程與離線資料。確定停止同步？")) return;
+  clearTimeout(syncUploadTimer);
+  saveSyncSettings(null);
+  state.syncDirty = false; state.syncStatus = "local"; state.syncDialog = null; state.openMenuId = null; render();
+}
+
+function useRemoteConflict() {
+  const conflict = state.syncConflict;
+  if (!conflict) return;
+  applyRemotePayload(conflict.remotePayload, conflict.remoteRevision, conflict.updatedAt);
+  state.syncConflict = null; state.syncStatus = "synced"; render();
+}
+
+async function overwriteRemoteConflict() {
+  const conflict = state.syncConflict;
+  if (!conflict || !confirm("確定要以此裝置版本覆蓋另一部裝置的新版行程？")) return;
+  state.syncConflict = null;
+  state.syncDirty = true;
+  await uploadSync(conflict.remoteRevision, true);
 }
 
 async function requestAppInstall() {
@@ -1299,6 +1476,17 @@ function bindEvents() {
   document.querySelectorAll("[data-install-app]").forEach((button) => button.addEventListener("click", requestAppInstall));
   document.querySelectorAll("[data-export-trip-data]").forEach((button) => button.addEventListener("click", exportTripData));
   document.querySelectorAll("[data-import-trip-data]").forEach((button) => button.addEventListener("click", () => document.querySelector("#trip-backup-input")?.click()));
+  document.querySelectorAll("[data-sync-enable]").forEach((button) => button.addEventListener("click", enableCloudSync));
+  document.querySelectorAll("[data-sync-join]").forEach((button) => button.addEventListener("click", () => { state.openMenuId = null; state.syncDialog = "join"; render(); }));
+  document.querySelectorAll("[data-sync-now]").forEach((button) => button.addEventListener("click", () => { state.openMenuId = null; syncNow(); }));
+  document.querySelectorAll("[data-sync-info]").forEach((button) => button.addEventListener("click", () => { state.openMenuId = null; state.syncDialog = "info"; render(); }));
+  document.querySelectorAll("[data-sync-stop]").forEach((button) => button.addEventListener("click", stopCloudSync));
+  document.querySelectorAll("[data-sync-close]").forEach((button) => button.addEventListener("click", () => { state.syncDialog = null; render(); }));
+  document.querySelector("#sync-join-form")?.addEventListener("submit", (event) => { event.preventDefault(); joinCloudSync(event.currentTarget); });
+  document.querySelectorAll("[data-copy-sync-link]").forEach((button) => button.addEventListener("click", async () => { try { await navigator.clipboard.writeText(currentSyncLink()); button.textContent = "已複製"; } catch { alert("無法自動複製，請長按連結後複製。"); } }));
+  document.querySelectorAll("[data-conflict-remote]").forEach((button) => button.addEventListener("click", useRemoteConflict));
+  document.querySelectorAll("[data-conflict-local]").forEach((button) => button.addEventListener("click", overwriteRemoteConflict));
+  document.querySelectorAll("[data-conflict-cancel]").forEach((button) => button.addEventListener("click", () => { state.syncConflict = null; state.syncStatus = "conflict"; render(); }));
   document.querySelector("#trip-backup-input")?.addEventListener("change", (event) => importTripData(event.currentTarget.files?.[0]));
   document.querySelectorAll("[data-close-install-dialog]").forEach((button) => button.addEventListener("click", () => { state.installDialogOpen = false; render(); }));
   document.querySelector("[data-apply-pwa-update]")?.addEventListener("click", applyPwaUpdate);
@@ -2306,10 +2494,16 @@ globalThis.addEventListener?.("appinstalled", () => {
   render();
 });
 
-document.addEventListener("visibilitychange", () => { if (document.hidden) stopSpeech(); });
+document.addEventListener("visibilitychange", () => { if (document.hidden) stopSpeech(); else syncNow(); });
+window.addEventListener("focus", syncNow);
+window.addEventListener("online", syncNow);
 window.addEventListener("pagehide", stopSpeech);
 function updateVisualViewportHeight() { if (globalThis.visualViewport && document.documentElement) document.documentElement.style.setProperty("--visual-viewport-height", `${visualViewport.height}px`); }
 globalThis.visualViewport?.addEventListener("resize", updateVisualViewportHeight);
 updateVisualViewportHeight();
 
 render();
+const syncFromUrl = (() => { try { return new URL(location.href).searchParams.get("sync"); } catch { return null; } })();
+if (syncFromUrl && !state.syncSettings) { state.syncDialog = "join"; render(); requestAnimationFrame(() => { const field = document.querySelector('#sync-join-form [name="link"]'); if (field) field.value = location.href; }); }
+else if (state.syncSettings) syncNow();
+globalThis.setInterval?.(() => { if (document.visibilityState === "visible") syncNow(); }, 30000);

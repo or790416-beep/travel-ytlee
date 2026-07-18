@@ -4,10 +4,20 @@ const dns = require("node:dns").promises;
 const fs = require("node:fs");
 const path = require("node:path");
 const net = require("node:net");
+const crypto = require("node:crypto");
+const { createClient } = require("@supabase/supabase-js");
 
 const PORT = Number(process.env.PORT || 4173);
 const ROOT = __dirname;
 const MAX_HTML_BYTES = 1024 * 1024;
+const MAX_SYNC_BODY_BYTES = 2 * 1024 * 1024;
+const SYNC_TABLE = "trip_sync";
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const supabase = SUPABASE_URL && SUPABASE_SECRET_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } })
+  : null;
+const syncRateLimits = new Map();
 const previewCache = new Map();
 const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".json": "application/json; charset=utf-8", ".webmanifest": "application/manifest+json", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".svg": "image/svg+xml" };
 
@@ -91,6 +101,113 @@ function json(response, status, payload) {
   response.end(JSON.stringify(payload));
 }
 
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value || "");
+}
+
+function validateSyncPayload(payload) {
+  return Boolean(payload && payload.schemaVersion === 6 && Array.isArray(payload.trips));
+}
+
+function hashSyncSecret(secret) {
+  return crypto.createHash("sha256").update(String(secret), "utf8").digest("hex");
+}
+
+function safeHashEqual(storedHash, suppliedHash) {
+  if (!/^[0-9a-f]{64}$/i.test(storedHash || "") || !/^[0-9a-f]{64}$/i.test(suppliedHash || "")) return false;
+  return crypto.timingSafeEqual(Buffer.from(storedHash, "hex"), Buffer.from(suppliedHash, "hex"));
+}
+
+function bearerSecret(request) {
+  const match = String(request.headers.authorization || "").match(/^Bearer\s+([^\s]+)$/i);
+  return match?.[1] || "";
+}
+
+function sameOrigin(request) {
+  const origin = request.headers.origin;
+  if (!origin) return true;
+  try { return new URL(origin).host === request.headers.host; } catch { return false; }
+}
+
+function allowSyncRequest(request) {
+  const now = Date.now();
+  const ip = request.socket.remoteAddress || "unknown";
+  const current = syncRateLimits.get(ip);
+  if (!current || now - current.startedAt >= 60000) { syncRateLimits.set(ip, { startedAt: now, count: 1 }); return true; }
+  current.count += 1;
+  return current.count <= 60;
+}
+
+function readJsonBody(request, limit = MAX_SYNC_BODY_BYTES) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    request.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > limit) { const error = new Error("body_too_large"); error.statusCode = 413; reject(error); request.destroy(); return; }
+      chunks.push(chunk);
+    });
+    request.on("end", () => {
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}")); }
+      catch { const error = new Error("invalid_json"); error.statusCode = 400; reject(error); }
+    });
+    request.on("error", reject);
+  });
+}
+
+function publicSyncRow(row) {
+  return { payload: row.payload, revision: row.revision, updatedAt: row.updated_at };
+}
+
+async function authenticatedSyncRow(client, syncId, secret) {
+  const { data, error } = await client.from(SYNC_TABLE).select("sync_id,secret_hash,payload,revision,updated_at").eq("sync_id", syncId).maybeSingle();
+  if (error || !data || !safeHashEqual(data.secret_hash, hashSyncSecret(secret))) return null;
+  return data;
+}
+
+async function handleSyncApi(request, response, requestUrl, client = supabase) {
+  if (!sameOrigin(request)) { json(response, 403, { error: "forbidden" }); return; }
+  if (!allowSyncRequest(request)) { json(response, 429, { error: "rate_limited" }); return; }
+  if (request.method === "GET" && requestUrl.pathname === "/api/sync/status") { json(response, 200, { enabled: Boolean(client) }); return; }
+  if (!client) { json(response, 503, { error: "sync_unavailable" }); return; }
+
+  try {
+    if (request.method === "POST" && requestUrl.pathname === "/api/sync/create") {
+      const body = await readJsonBody(request);
+      if (!validateSyncPayload(body.payload)) { json(response, 400, { error: "invalid_payload" }); return; }
+      const syncId = crypto.randomUUID();
+      const secretBytes = new Uint8Array(32);
+      crypto.webcrypto.getRandomValues(secretBytes);
+      const syncSecret = Buffer.from(secretBytes).toString("base64url");
+      const { data, error } = await client.from(SYNC_TABLE).insert({ sync_id: syncId, secret_hash: hashSyncSecret(syncSecret), payload: body.payload, revision: 1 }).select("revision,updated_at").single();
+      if (error || !data) throw new Error("database_create_failed");
+      json(response, 201, { syncId, syncSecret, revision: data.revision, updatedAt: data.updated_at });
+      return;
+    }
+
+    const match = requestUrl.pathname.match(/^\/api\/sync\/([^/]+)$/);
+    if (!match || !["GET", "PUT"].includes(request.method)) { json(response, 404, { error: "not_found" }); return; }
+    const syncId = match[1];
+    if (!isUuid(syncId)) { json(response, 404, { error: "not_found" }); return; }
+    const row = await authenticatedSyncRow(client, syncId, bearerSecret(request));
+    if (!row) { json(response, 404, { error: "not_found" }); return; }
+    if (request.method === "GET") { json(response, 200, publicSyncRow(row)); return; }
+
+    const body = await readJsonBody(request);
+    if (!validateSyncPayload(body.payload) || !Number.isInteger(body.baseRevision) || body.baseRevision < 1) { json(response, 400, { error: "invalid_payload" }); return; }
+    const nextRevision = body.baseRevision + 1;
+    const updatedAt = new Date().toISOString();
+    const { data, error } = await client.from(SYNC_TABLE).update({ payload: body.payload, revision: nextRevision, updated_at: updatedAt }).eq("sync_id", syncId).eq("revision", body.baseRevision).select("revision,updated_at").maybeSingle();
+    if (error) throw new Error("database_update_failed");
+    if (data) { json(response, 200, { revision: data.revision, updatedAt: data.updated_at }); return; }
+    const remote = await authenticatedSyncRow(client, syncId, bearerSecret(request));
+    if (!remote) { json(response, 404, { error: "not_found" }); return; }
+    json(response, 409, { error: "revision_conflict", remoteRevision: remote.revision, remotePayload: remote.payload, updatedAt: remote.updated_at });
+  } catch (error) {
+    json(response, error.statusCode || 500, { error: error.statusCode === 413 ? "body_too_large" : error.statusCode === 400 ? "invalid_json" : "sync_request_failed" });
+  }
+}
+
 async function handlePreview(requestUrl, response) {
   const value = requestUrl.searchParams.get("url") || "";
   let target;
@@ -121,6 +238,7 @@ function serveStatic(requestUrl, response, method) {
 
 const server = http.createServer(async (request, response) => {
   const requestUrl = new URL(request.url, `http://${request.headers.host || "localhost"}`);
+  if (requestUrl.pathname.startsWith("/api/sync")) return handleSyncApi(request, response, requestUrl);
   if (request.method === "GET" && requestUrl.pathname === "/api/link-preview") return handlePreview(requestUrl, response);
   if (!["GET", "HEAD"].includes(request.method)) { response.writeHead(405, { Allow: "GET, HEAD" }).end(); return; }
   serveStatic(requestUrl, response, request.method);
@@ -128,4 +246,4 @@ const server = http.createServer(async (request, response) => {
 
 if (require.main === module) server.listen(PORT, "0.0.0.0", () => console.log(`Travel SPA server: http://localhost:${PORT}`));
 
-module.exports = { isBlockedIp, resolvePublic, metaMap, parsePreview, fetchHtml, server };
+module.exports = { isBlockedIp, resolvePublic, metaMap, parsePreview, fetchHtml, isUuid, validateSyncPayload, hashSyncSecret, safeHashEqual, handleSyncApi, server };
