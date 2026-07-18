@@ -1775,3 +1775,14 @@ a,
 .sync-warning { padding: 10px 12px; border-radius: 10px; background: #fff1d9; color: #704a12; font-weight: 700; }
 .sync-actions { display: grid; grid-template-columns: 1fr; }
 @keyframes sync-pulse { to { opacity: .35; } }
+
+/* v6-ui-14-sync-2: packing actions and URL-to-URL rhythm only. */
+.packing-list .menu-button { min-width: 38px; min-height: 38px; }
+.danger-menu-item { color: #a51d38 !important; }
+.reference-card-list {
+  display: grid;
+  row-gap: 6px;
+  margin: 0;
+  padding: 0;
+}
+.reference-card-list > * { margin-block: 0; }
