@@ -22,7 +22,7 @@ for (const icon of manifest.icons) {
 assert.equal(fs.existsSync("icons/apple-touch-icon.png"), true);
 assert.equal(fs.existsSync("icons/favicon-32.png"), true);
 
-assert.match(worker, /travel-app-v6-ui-14-sync-3/);
+assert.match(worker, /travel-app-v6-ui-14-sync-4/);
 assert.match(worker, /requestUrl\.pathname\.startsWith\("\/api\/"\)/);
 assert.match(worker, /event\.request\.mode === "navigate"/);
 assert.match(worker, /SKIP_WAITING/);
