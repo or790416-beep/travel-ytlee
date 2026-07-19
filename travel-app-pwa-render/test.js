@@ -33,7 +33,7 @@ const context = {
 };
 context.globalThis = context;
 vm.createContext(context);
-vm.runInContext(`${fs.readFileSync("app.js", "utf8")}\n;globalThis.__test={state,migrateTrip,normalizeTripEditDay,makeTripEditDraft,isHttpUrl,normalizeBooking,normalizePhrase,deleteTimelineItem,restoreDeletedTimelineItem,deleteBooking,speakJapanese,stopSpeech,cancelAttachedAdd,phraseCategoryLabel,insertTimelineAbove,renderTimelineItem,renderFlight,renderReference,renderEditModal,renderMapActions,renderTools,renderPacking,renderMobileActionSheet,renderPackingDialog,packingGroupIdentity,findPackingGroup,findPackingItem,addPackingGroup,deletePackingGroup,addPackingChild,deletePackingChild,renamePackingGroup,deletePackingItem,buildDirectionsUrl,transportModes,openEditModal,cancelEditModal,applyEditValues,saveTrip,stableColorIndex,referenceFallbackIcon,addTrip,switchTrip,addDay,deleteDay,toggleOverviewDay,moveOverviewDay,sortOverviewDaysByDate,stableSortDaysByDate,saveTripEditDraft,startNewCollection,deleteCollection,renderCollectionCard,renderDayCollectionEntries,renderDayNotice,renderCollectionPanel,renderTripSelectorDialog,formatClock,getTripWeekday,formatTripWeekday,formatTripDate,findUnexpectedHorizontalOverflow};`, context);
+vm.runInContext(`${fs.readFileSync("app.js", "utf8")}\n;globalThis.__test={state,migrateTrip,normalizeTripEditDay,makeTripEditDraft,updateTripDraftField,handleTripEditorInput,handleTripEditorCompositionStart,handleTripEditorCompositionEnd,isTripEditing,applyRemotePayload,releasePendingRemoteUpdate,isHttpUrl,normalizeBooking,normalizePhrase,deleteTimelineItem,restoreDeletedTimelineItem,deleteBooking,speakJapanese,stopSpeech,cancelAttachedAdd,phraseCategoryLabel,insertTimelineAbove,renderTimelineItem,renderFlight,renderReference,renderEditModal,renderMapActions,renderTools,renderPacking,renderMobileActionSheet,renderPackingDialog,packingGroupIdentity,findPackingGroup,findPackingItem,addPackingGroup,deletePackingGroup,addPackingChild,deletePackingChild,renamePackingGroup,deletePackingItem,buildDirectionsUrl,transportModes,openEditModal,cancelEditModal,saveEditModal,applyEditValues,saveTrip,stableColorIndex,referenceFallbackIcon,addTrip,switchTrip,addDay,deleteDay,toggleOverviewDay,moveOverviewDay,sortOverviewDaysByDate,stableSortDaysByDate,saveTripEditDraft,startNewCollection,deleteCollection,renderCollectionCard,renderDayCollectionEntries,renderDayNotice,renderCollectionPanel,renderTripSelectorDialog,formatClock,getTripWeekday,formatTripWeekday,formatTripDate,findUnexpectedHorizontalOverflow};`, context);
 const api = context.__test;
 
 assert.equal(api.state.root.schemaVersion, 6);
@@ -260,6 +260,8 @@ assert.match(collapsedTripEditHtml, /overview-accordion/);
 assert.match(collapsedTripEditHtml, /data-drag-overview-day=/);
 assert.match(collapsedTripEditHtml, /data-sort-overview-days/);
 assert.match(collapsedTripEditHtml, /data-move-overview-day=/);
+assert.match(collapsedTripEditHtml, /data-direction="up"[^>]*disabled/);
+assert.match(collapsedTripEditHtml, /data-direction="down"[^>]*disabled/);
 assert.match(collapsedTripEditHtml, /data-edit-trip-day=/);
 assert.doesNotMatch(collapsedTripEditHtml, /data-edit-overview-day=/);
 assert.doesNotMatch(collapsedTripEditHtml, /draggable=/);
@@ -329,6 +331,85 @@ api.state.tripEditDraft = JSON.parse(JSON.stringify(api.state.trip));
 api.state.tripEditDraft.days[0].date = "2027-04-01";
 api.state.tripEditDraft.days[1].date = "2027-04-01";
 assert.equal(api.saveTripEditDraft({}), false);
+
+const emptyDraftDay = api.normalizeTripEditDay({ id: 0, area: "", region: "舊區域", title: "", description: "舊描述", transportTip: "", luggageTip: "" });
+assert.equal(emptyDraftDay.area, "");
+assert.equal(emptyDraftDay.title, "");
+api.state.editModal = { type: "trip", id: api.state.trip.id };
+api.state.tripEditDraft = api.makeTripEditDraft(api.state.trip);
+api.state.tripEditDraft.days[0].id = 0;
+const writesBeforeTyping = storageWrites;
+api.state.syncDirty = false;
+const editorField = (dataset, value) => ({ dataset, value, closest: (selector) => selector.includes("edit-modal-form") ? {} : selector === "[data-trip-field]" && dataset.tripField ? field : selector === "[data-trip-day-field]" && dataset.tripDayField ? field : null });
+let field = editorField({ tripField: "notice" }, "第一行\n貼上第二行");
+api.handleTripEditorInput({ target: field });
+assert.equal(api.state.tripEditDraft.notice, "第一行\n貼上第二行");
+field = editorField({ tripDayField: "title", dayId: "0" }, "");
+api.handleTripEditorInput({ target: field });
+assert.equal(api.state.tripEditDraft.days[0].title, "");
+field = editorField({ tripDayField: "area", dayId: "0" }, "台");
+api.handleTripEditorCompositionStart({ target: field });
+api.handleTripEditorInput({ target: field });
+field.value = "台北中文";
+api.handleTripEditorCompositionEnd({ target: field });
+assert.equal(api.state.tripEditDraft.days[0].area, "台北中文");
+assert.equal(api.state.tripEditComposing, false);
+assert.equal(storageWrites, writesBeforeTyping);
+assert.equal(api.state.syncDirty, false);
+const inputHandlerSource = fs.readFileSync("app.js", "utf8").match(/function handleTripEditorInput\([\s\S]*?\n}/)?.[0] || "";
+assert.doesNotMatch(inputHandlerSource, /render\(|saveTrip\(|preventDefault/);
+
+const formalBeforeRemote = JSON.stringify(api.state.root);
+const draftBeforeRemote = JSON.stringify(api.state.tripEditDraft);
+const remoteWhileEditing = JSON.parse(JSON.stringify(api.state.root));
+remoteWhileEditing.trips[0].notice = "遠端新版";
+assert.equal(api.applyRemotePayload(remoteWhileEditing, 99, "2027-01-01T00:00:00Z"), false);
+assert.equal(JSON.stringify(api.state.root), formalBeforeRemote);
+assert.equal(JSON.stringify(api.state.tripEditDraft), draftBeforeRemote);
+assert.equal(api.state.pendingRemoteUpdate.remoteRevision, 99);
+api.state.pendingRemoteUpdate = null;
+
+const formalOrderBeforeMoveSafety = api.state.trip.days.map((day) => day.id);
+const moveDays = [
+  { id: 0, title: "零", timeline: [{ id: "timeline-zero" }], flights: [], references: [], lodgings: [], dining: [] },
+  { id: "middle", title: "中", timeline: [{ id: "timeline-middle" }], flights: [{ id: "flight-middle" }], references: [{ id: "reference-middle" }], lodgings: [{ id: "lodging-middle" }], dining: [{ id: "dining-middle" }] },
+  { id: "last", title: "末", timeline: [], flights: [], references: [], lodgings: [], dining: [] },
+];
+api.state.tripEditDraft.days = JSON.parse(JSON.stringify(moveDays));
+api.state.expandedOverviewDayId = "middle";
+const moveScrollBody = { scrollTop: 246 };
+const movedRows = moveDays.map((day) => ({ dataset: { overviewDayId: String(day.id) }, scrollIntoView: (options) => { nearestScrollOptions = options; } }));
+context.document.querySelector = (selector) => selector === '#edit-modal-form[data-edit-type="trip"] .modal-body' ? moveScrollBody : originalQuerySelector(selector);
+context.document.querySelectorAll = (selector) => selector === "[data-overview-day-id]" ? movedRows : originalQuerySelectorAll(selector);
+assert.equal(api.moveOverviewDay("middle", "up"), true);
+assert.deepEqual(Array.from(api.state.tripEditDraft.days, (day) => day.id), ["middle", 0, "last"]);
+assert.equal(api.moveOverviewDay("middle", "down"), true);
+assert.deepEqual(Array.from(api.state.tripEditDraft.days, (day) => day.id), [0, "middle", "last"]);
+assert.equal(api.moveOverviewDay(0, "up"), false);
+assert.equal(api.moveOverviewDay("last", "down"), false);
+assert.equal(api.state.expandedOverviewDayId, "middle");
+assert.equal(moveScrollBody.scrollTop, 246);
+assert.equal(nearestScrollOptions?.block, "nearest");
+assert.deepEqual(api.state.trip.days.map((day) => day.id), formalOrderBeforeMoveSafety);
+assert.equal(api.state.tripEditDraft.days[1].timeline[0].id, "timeline-middle");
+assert.equal(api.state.tripEditDraft.days[1].flights[0].id, "flight-middle");
+assert.equal(api.state.tripEditDraft.days[1].references[0].id, "reference-middle");
+assert.equal(api.state.tripEditDraft.days[1].lodgings[0].id, "lodging-middle");
+assert.equal(api.state.tripEditDraft.days[1].dining[0].id, "dining-middle");
+context.document.querySelector = originalQuerySelector;
+context.document.querySelectorAll = originalQuerySelectorAll;
+
+api.state.tripEditDraft = api.makeTripEditDraft(api.state.trip);
+api.state.editModal = { type: "trip", id: api.state.trip.id };
+api.state.tripEditDraft.notice = "儲存後文字";
+api.state.syncSettings = { syncId: "trip-test", syncSecret: "trip-test", revision: 1 };
+api.state.syncDirty = false;
+const writesBeforeTripSave = storageWrites;
+api.saveEditModal({ preventDefault() {}, currentTarget: { dataset: { editType: "trip" }, querySelectorAll: () => [] } });
+assert.equal(api.state.trip.notice, "儲存後文字");
+assert.ok(storageWrites > writesBeforeTripSave);
+assert.equal(api.state.syncDirty, true);
+api.state.syncSettings = null;
 const flightCardMarkup = api.renderFlight({ id: "flight-layout", airline: "很長很長的航空公司名稱", flightNumber: "AB123", departureCode: "TPE", arrivalCode: "FUK", departureTime: "2027-01-01 10:00", arrivalTime: "2027-01-01 13:00", websiteUrl: "https://example.com" }, api.state.trip.days[0]);
 assert.match(flightCardMarkup, /preview-card-shell[\s\S]*flight-summary[\s\S]*card-corner-actions/);
 assert.doesNotMatch(flightCardMarkup, /inline-actions/);

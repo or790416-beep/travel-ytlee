@@ -305,11 +305,11 @@ function normalizeTripEditDay(day = {}) {
   return {
     ...day,
     id: day.id ?? createId(),
-    date: day.date || "",
-    area: day.area || day.region || day.location || "",
-    title: day.title || day.description || day.summary || "",
-    transportTip: day.transportTip || "",
-    luggageTip: day.luggageTip || "",
+    date: day.date ?? "",
+    area: day.area ?? day.region ?? day.location ?? "",
+    title: day.title ?? day.description ?? day.summary ?? "",
+    transportTip: day.transportTip ?? "",
+    luggageTip: day.luggageTip ?? "",
     timeline: Array.isArray(day.timeline) ? day.timeline : [],
     flights: Array.isArray(day.flights) ? day.flights : [],
     references: Array.isArray(day.references) ? day.references : [],
@@ -462,6 +462,8 @@ const state = {
   tripEditDraft: null,
   expandedOverviewDayId: null,
   tripEditScrollTop: 0,
+  tripEditComposing: false,
+  pendingRemoteUpdate: null,
   installDialogOpen: false,
   pwaUpdateReady: false,
   packingDialog: null,
@@ -487,6 +489,10 @@ if (!modalRoot) {
   root.addEventListener("click", handlePackingManagementClick);
 });
 modalRoot.addEventListener("submit", handlePackingDialogSubmit);
+modalRoot.addEventListener("input", handleTripEditorInput);
+modalRoot.addEventListener("compositionstart", handleTripEditorCompositionStart);
+modalRoot.addEventListener("compositionend", handleTripEditorCompositionEnd);
+modalRoot.addEventListener("click", handleTripEditorMovement);
 app.addEventListener("change", handlePackingChange);
 
 function render() {
@@ -658,6 +664,11 @@ async function enableCloudSync() {
 
 function applyRemotePayload(payload, revision, updatedAt) {
   if (!payload || payload.schemaVersion !== 6 || !Array.isArray(payload.trips)) throw new Error("雲端資料格式不正確");
+  if (isTripEditing()) {
+    state.pendingRemoteUpdate = { remoteRevision: revision, remotePayload: payload, updatedAt };
+    state.syncStatus = "conflict";
+    return false;
+  }
   applyingRemote = true;
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
@@ -667,11 +678,20 @@ function applyRemotePayload(payload, revision, updatedAt) {
     updateSyncRevision(revision, updatedAt);
     state.syncDirty = false;
   } finally { applyingRemote = false; }
+  return true;
+}
+
+function releasePendingRemoteUpdate() {
+  if (!state.pendingRemoteUpdate) return false;
+  state.syncConflict = state.pendingRemoteUpdate;
+  state.pendingRemoteUpdate = null;
+  state.syncStatus = "conflict";
+  return true;
 }
 
 async function downloadSync({ joining = false, credentials = state.syncSettings } = {}) {
   if (!credentials || syncInFlight) return;
-  syncInFlight = true; state.syncStatus = "syncing"; render();
+  syncInFlight = true; state.syncStatus = "syncing"; if (!isTripEditing()) render();
   try {
     const { response, body } = await syncFetch(`/api/sync/${encodeURIComponent(credentials.syncId)}`, { headers: { Authorization: `Bearer ${credentials.syncSecret}` } });
     if (!response.ok) throw new Error(response.status === 404 ? "同步代碼或密鑰不正確" : "下載同步資料失敗");
@@ -680,22 +700,29 @@ async function downloadSync({ joining = false, credentials = state.syncSettings 
       localStorage.setItem(`${STORAGE_KEY}-before-cloud-${Date.now()}`, JSON.stringify(state.root));
       saveSyncSettings({ syncId: credentials.syncId, syncSecret: credentials.syncSecret, revision: body.revision, lastSyncedAt: body.updatedAt });
     } else if (body.revision <= credentials.revision) { state.syncStatus = "synced"; return; }
+    else if (isTripEditing()) { state.pendingRemoteUpdate = { remoteRevision: body.revision, remotePayload: body.payload, updatedAt: body.updatedAt }; state.syncStatus = "conflict"; return; }
     else if (state.syncDirty) { state.syncConflict = { remoteRevision: body.revision, remotePayload: body.payload, updatedAt: body.updatedAt }; state.syncStatus = "conflict"; render(); return; }
     applyRemotePayload(body.payload, body.revision, body.updatedAt);
     state.syncDialog = null; state.syncStatus = "synced"; render();
-  } catch (error) { state.syncStatus = navigator.onLine === false ? "offline" : "failed"; if (joining) alert(error.message); render(); }
+  } catch (error) { state.syncStatus = navigator.onLine === false ? "offline" : "failed"; if (joining) alert(error.message); if (!isTripEditing()) render(); }
   finally { syncInFlight = false; }
 }
 
 async function uploadSync(baseRevision = state.syncSettings?.revision, forced = false) {
   if (!state.syncSettings || syncInFlight || (!state.syncDirty && !forced)) return;
-  syncInFlight = true; state.syncStatus = "syncing"; render();
+  syncInFlight = true; state.syncStatus = "syncing"; if (!isTripEditing()) render();
   try {
     const { response, body } = await syncFetch(`/api/sync/${encodeURIComponent(state.syncSettings.syncId)}`, { method: "PUT", headers: { Authorization: `Bearer ${state.syncSettings.syncSecret}` }, body: JSON.stringify({ payload: state.root, baseRevision }) });
-    if (response.status === 409) { state.syncConflict = body; state.syncStatus = "conflict"; render(); return; }
+    if (response.status === 409) {
+      if (isTripEditing()) state.pendingRemoteUpdate = body;
+      else state.syncConflict = body;
+      state.syncStatus = "conflict";
+      if (!isTripEditing()) render();
+      return;
+    }
     if (!response.ok) throw new Error("上傳同步資料失敗");
-    updateSyncRevision(body.revision, body.updatedAt); state.syncDirty = false; state.syncConflict = null; state.syncStatus = "synced"; render();
-  } catch { state.syncStatus = navigator.onLine === false ? "offline" : "failed"; render(); }
+    updateSyncRevision(body.revision, body.updatedAt); state.syncDirty = false; state.syncConflict = null; state.syncStatus = "synced"; if (!isTripEditing()) render();
+  } catch { state.syncStatus = navigator.onLine === false ? "offline" : "failed"; if (!isTripEditing()) render(); }
   finally { syncInFlight = false; }
 }
 
@@ -1249,7 +1276,8 @@ function renderEditModal() {
   let preview = "";
   if (type === "trip") {
     title = "編輯旅行";
-    fields = `${input("title", "旅行名稱")}${input("startDate", "開始日期", item.startDate, "date")}${input("endDate", "結束日期", item.endDate, "date")}<label>注意事項<textarea class="text-input edit-textarea" data-edit-field="notice">${escapeHtml(item.notice)}</textarea></label><section class="trip-days-editor"><div class="collection-heading"><h3>行程總覽管理</h3><div class="overview-toolbar"><button class="secondary-button" type="button" data-sort-overview-days>依日期排序</button><button class="secondary-button" type="button" data-add-day>新增日期</button></div></div><p class="trip-day-edit-error" role="alert" hidden></p>${item.days.map((entry, index) => { const expanded = String(entry.id) === String(state.expandedOverviewDayId); return `<article class="overview-accordion ${expanded ? "expanded" : ""}" data-overview-day-id="${escapeAttr(entry.id)}"><div class="overview-summary"><button class="overview-drag-handle" type="button" data-drag-overview-day="${escapeAttr(entry.id)}" aria-label="拖曳調整第 ${index + 1} 天順序">⠿</button><div class="overview-summary-copy"><b>D${index + 1}</b><span>${escapeHtml(entry.date ? formatTripDate(entry.date) : "日期未定")}</span><span>${escapeHtml(entry.area || "區域未定")}</span><small>${escapeHtml(entry.title || "尚無描述")}</small></div><div class="overview-actions"><button class="order-button" type="button" data-move-overview-day="${escapeAttr(entry.id)}" data-direction="up" aria-label="將第 ${index + 1} 天上移" ${index === 0 ? "disabled" : ""}>↑</button><button class="order-button" type="button" data-move-overview-day="${escapeAttr(entry.id)}" data-direction="down" aria-label="將第 ${index + 1} 天下移" ${index === item.days.length - 1 ? "disabled" : ""}>↓</button><button class="secondary-button overview-edit-button" type="button" data-edit-trip-day="${escapeAttr(entry.id)}">${expanded ? "收合" : "編輯"}</button></div></div>${expanded ? `<div class="overview-expanded"><div class="day-overview-grid"><label>日期<input class="text-input overview-date-input" type="date" data-native-date-picker data-edit-field="day.${entry.id}.date" value="${escapeAttr(entry.date)}"><small class="date-weekday" data-date-weekday>${escapeHtml(formatTripWeekday(entry.date))}</small></label><label>區域<input class="text-input" data-edit-field="day.${entry.id}.area" value="${escapeAttr(entry.area)}"></label><label class="day-description-field">描述<textarea class="text-input day-description-input" data-edit-field="day.${entry.id}.title">${escapeHtml(entry.title)}</textarea></label></div><fieldset class="day-notice-editor"><legend>當日注意事項</legend><label>交通<textarea class="text-input" data-edit-field="day.${entry.id}.transportTip">${escapeHtml(entry.transportTip || "")}</textarea></label><label>行李<textarea class="text-input" data-edit-field="day.${entry.id}.luggageTip">${escapeHtml(entry.luggageTip || "")}</textarea></label></fieldset><button class="danger-button" type="button" data-delete-day="${escapeAttr(entry.id)}">刪除此日期</button></div>` : ""}</article>`; }).join("")}</section>`;
+    const tripInput = (field, label, value = item[field], typeAttr = "text") => `<label>${label}<input class="text-input" type="${typeAttr}" data-edit-field="${field}" data-trip-field="${field}" value="${escapeAttr(value ?? "")}"></label>`;
+    fields = `${tripInput("title", "旅行名稱")}${tripInput("startDate", "開始日期", item.startDate, "date")}${tripInput("endDate", "結束日期", item.endDate, "date")}<label>注意事項<textarea class="text-input edit-textarea" data-edit-field="notice" data-trip-field="notice">${escapeHtml(item.notice ?? "")}</textarea></label><section class="trip-days-editor"><div class="collection-heading"><h3>行程總覽管理</h3><div class="overview-toolbar"><button class="secondary-button" type="button" data-sort-overview-days>依日期排序</button><button class="secondary-button" type="button" data-add-day>新增日期</button></div></div><p class="trip-day-edit-error" role="alert" hidden></p>${item.days.map((entry, index) => { const expanded = String(entry.id) === String(state.expandedOverviewDayId); return `<article class="overview-accordion ${expanded ? "expanded" : ""}" data-overview-day-id="${escapeAttr(entry.id)}"><div class="overview-summary"><button class="overview-drag-handle" type="button" data-drag-overview-day="${escapeAttr(entry.id)}" aria-label="拖曳調整第 ${index + 1} 天順序">⠿</button><div class="overview-summary-copy"><b>D${index + 1}</b><span>${escapeHtml(entry.date ? formatTripDate(entry.date) : "日期未定")}</span><span>${escapeHtml(entry.area || "區域未定")}</span><small>${escapeHtml(entry.title || "尚無描述")}</small></div><div class="overview-actions"><button class="order-button" type="button" data-move-overview-day="${escapeAttr(entry.id)}" data-direction="up" aria-label="將第 ${index + 1} 天上移" ${index === 0 ? "disabled" : ""}>↑</button><button class="order-button" type="button" data-move-overview-day="${escapeAttr(entry.id)}" data-direction="down" aria-label="將第 ${index + 1} 天下移" ${index === item.days.length - 1 ? "disabled" : ""}>↓</button><button class="secondary-button overview-edit-button" type="button" data-edit-trip-day="${escapeAttr(entry.id)}">${expanded ? "收合" : "編輯"}</button></div></div>${expanded ? `<div class="overview-expanded"><div class="day-overview-grid"><label>日期<input class="text-input overview-date-input" type="date" data-native-date-picker data-edit-field="day.${entry.id}.date" data-trip-day-field="date" data-day-id="${escapeAttr(entry.id)}" value="${escapeAttr(entry.date ?? "")}"><small class="date-weekday" data-date-weekday>${escapeHtml(formatTripWeekday(entry.date))}</small></label><label>區域<input class="text-input" data-edit-field="day.${entry.id}.area" data-trip-day-field="area" data-day-id="${escapeAttr(entry.id)}" value="${escapeAttr(entry.area ?? "")}"></label><label class="day-description-field">描述<textarea class="text-input day-description-input" data-edit-field="day.${entry.id}.title" data-trip-day-field="title" data-day-id="${escapeAttr(entry.id)}">${escapeHtml(entry.title ?? "")}</textarea></label></div><fieldset class="day-notice-editor"><legend>當日注意事項</legend><label>交通<textarea class="text-input" data-edit-field="day.${entry.id}.transportTip" data-trip-day-field="transportTip" data-day-id="${escapeAttr(entry.id)}">${escapeHtml(entry.transportTip ?? "")}</textarea></label><label>行李<textarea class="text-input" data-edit-field="day.${entry.id}.luggageTip" data-trip-day-field="luggageTip" data-day-id="${escapeAttr(entry.id)}">${escapeHtml(entry.luggageTip ?? "")}</textarea></label></fieldset><button class="danger-button" type="button" data-delete-day="${escapeAttr(entry.id)}">刪除此日期</button></div>` : ""}</article>`; }).join("")}</section>`;
   } else if (type === "notice") {
     title = "編輯注意事項";
     fields = `<label>注意事項<textarea class="text-input edit-textarea" data-edit-field="notice">${escapeHtml(item.notice)}</textarea></label>`;
@@ -1398,7 +1426,6 @@ function bindEvents() {
   document.querySelectorAll("[data-add-day]").forEach((button) => button.addEventListener("click", addDay));
   document.querySelectorAll("[data-delete-day]").forEach((button) => button.addEventListener("click", () => deleteDay(button.dataset.deleteDay)));
   document.querySelector('#edit-modal-form[data-edit-type="trip"]')?.addEventListener("click", handleTripDayEditClick);
-  document.querySelectorAll("[data-move-overview-day]").forEach((button) => button.addEventListener("click", () => moveOverviewDay(button.dataset.moveOverviewDay, button.dataset.direction)));
   document.querySelectorAll("[data-sort-overview-days]").forEach((button) => button.addEventListener("click", sortOverviewDaysByDate));
   document.querySelectorAll("[data-native-date-picker]").forEach((field) => {
     field.addEventListener("click", () => { try { field.showPicker?.(); } catch {} });
@@ -1868,6 +1895,48 @@ function handleTripDayEditClick(event) {
   toggleOverviewDay(button.dataset.editTripDay);
 }
 
+function isTripEditing() {
+  return state.editModal?.type === "trip" && Boolean(state.tripEditDraft);
+}
+
+function updateTripDraftField(dayId, field, value) {
+  const day = state.tripEditDraft?.days.find((item) => String(item.id) === String(dayId));
+  if (!day) { showTripDayEditError("找不到這筆行程，請重新開啟編輯視窗。"); return false; }
+  day[field] = value;
+  return true;
+}
+
+function handleTripEditorInput(event) {
+  const editor = event.target.closest?.('#edit-modal-form[data-edit-type="trip"]');
+  if (!editor || !state.tripEditDraft) return;
+  const tripField = event.target.closest?.("[data-trip-field]");
+  const dayField = event.target.closest?.("[data-trip-day-field]");
+  if (tripField) state.tripEditDraft[tripField.dataset.tripField] = tripField.value;
+  if (dayField && updateTripDraftField(dayField.dataset.dayId, dayField.dataset.tripDayField, dayField.value) && dayField.dataset.tripDayField === "date" && !state.tripEditComposing) {
+    const weekday = dayField.closest("label")?.querySelector("[data-date-weekday]");
+    if (weekday) weekday.textContent = formatTripWeekday(dayField.value);
+  }
+}
+
+function handleTripEditorCompositionStart(event) {
+  if (event.target.closest?.('#edit-modal-form[data-edit-type="trip"]')) state.tripEditComposing = true;
+}
+
+function handleTripEditorCompositionEnd(event) {
+  if (!event.target.closest?.('#edit-modal-form[data-edit-type="trip"]')) return;
+  state.tripEditComposing = false;
+  handleTripEditorInput(event);
+}
+
+function handleTripEditorMovement(event) {
+  const button = event.target.closest?.("[data-move-overview-day]");
+  if (!button || !event.currentTarget.contains(button)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (button.disabled) return;
+  moveOverviewDay(button.dataset.moveOverviewDay, button.dataset.direction);
+}
+
 function showTripDayEditError(message) {
   const target = document.querySelector(".trip-day-edit-error");
   if (target) { target.hidden = false; target.textContent = message; }
@@ -1875,13 +1944,24 @@ function showTripDayEditError(message) {
 }
 
 function moveOverviewDay(id, direction) {
-  syncTripDraftFromForm();
   const days = state.tripEditDraft?.days;
   if (!days) return;
-  const from = days.findIndex((day) => day.id === id);
+  const from = days.findIndex((day) => String(day.id) === String(id));
+  if (from === -1) { showTripDayEditError("找不到這筆行程，請重新開啟編輯視窗。"); return false; }
   const to = direction === "up" ? from - 1 : from + 1;
-  if (from < 0 || to < 0 || to >= days.length) return;
-  const [day] = days.splice(from, 1); days.splice(to, 0, day); render();
+  if (to < 0 || to >= days.length) return false;
+  const modalBody = document.querySelector('#edit-modal-form[data-edit-type="trip"] .modal-body');
+  state.tripEditScrollTop = modalBody?.scrollTop ?? state.tripEditScrollTop;
+  const [day] = days.splice(from, 1);
+  days.splice(to, 0, day);
+  render();
+  requestAnimationFrame(() => {
+    const nextBody = document.querySelector('#edit-modal-form[data-edit-type="trip"] .modal-body');
+    if (nextBody) nextBody.scrollTop = state.tripEditScrollTop;
+    const moved = [...document.querySelectorAll("[data-overview-day-id]")].find((row) => String(row.dataset.overviewDayId) === String(day.id));
+    moved?.scrollIntoView({ block: "nearest" });
+  });
+  return true;
 }
 
 function sortOverviewDaysByDate() {
@@ -1939,7 +2019,7 @@ function syncTripDraftFromForm() {
   const form = document.querySelector('#edit-modal-form[data-edit-type="trip"]');
   if (!form) return;
   const editFields = [...form.querySelectorAll("[data-edit-field]")];
-  const value = (key) => editFields.find((field) => field.dataset.editField === key)?.value.trim();
+  const value = (key) => editFields.find((field) => field.dataset.editField === key)?.value;
   state.tripEditDraft.title = value("title") ?? state.tripEditDraft.title;
   state.tripEditDraft.startDate = value("startDate") ?? state.tripEditDraft.startDate;
   state.tripEditDraft.endDate = value("endDate") ?? state.tripEditDraft.endDate;
@@ -2078,6 +2158,8 @@ function cancelEditModal() {
   state.tripEditDraft = null;
   state.expandedOverviewDayId = null;
   state.tripEditScrollTop = 0;
+  state.tripEditComposing = false;
+  releasePendingRemoteUpdate();
   render();
 }
 
@@ -2085,14 +2167,21 @@ function saveEditModal(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const values = {};
-  form.querySelectorAll("[data-edit-field]").forEach((field) => { values[field.dataset.editField] = field.value.trim(); });
-  const saved = form.dataset.editType === "trip" ? saveTripEditDraft(values) : applyEditValues(form.dataset.editType, form.dataset.editId, values);
+  let saved;
+  if (form.dataset.editType === "trip") {
+    syncTripDraftFromForm();
+    saved = saveTripEditDraft({});
+  } else {
+    form.querySelectorAll("[data-edit-field]").forEach((field) => { values[field.dataset.editField] = field.value.trim(); });
+    saved = applyEditValues(form.dataset.editType, form.dataset.editId, values);
+  }
   if (saved) {
     state.editModal = null;
     state.tripEditDraft = null;
     state.expandedOverviewDayId = null;
     state.tripEditScrollTop = 0;
     saveTrip();
+    releasePendingRemoteUpdate();
     render();
   }
 }
