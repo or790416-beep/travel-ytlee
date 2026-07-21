@@ -33,7 +33,7 @@ const context = {
 };
 context.globalThis = context;
 vm.createContext(context);
-vm.runInContext(`${fs.readFileSync("app.js", "utf8")}\n;globalThis.__test={state,migrateTrip,normalizeTripEditDay,makeTripEditDraft,updateTripDraftField,handleTripEditorInput,handleTripEditorCompositionStart,handleTripEditorCompositionEnd,isTripEditing,applyRemotePayload,releasePendingRemoteUpdate,isHttpUrl,normalizeBooking,normalizePhrase,deleteTimelineItem,restoreDeletedTimelineItem,deleteBooking,speakJapanese,stopSpeech,cancelAttachedAdd,phraseCategoryLabel,insertTimelineAbove,renderTimelineItem,renderFlight,renderReference,renderEditModal,renderMapActions,renderTools,renderPacking,renderMobileActionSheet,renderPackingDialog,packingGroupIdentity,findPackingGroup,findPackingItem,addPackingGroup,deletePackingGroup,addPackingChild,deletePackingChild,renamePackingGroup,deletePackingItem,buildDirectionsUrl,transportModes,openEditModal,cancelEditModal,saveEditModal,applyEditValues,saveTrip,stableColorIndex,referenceFallbackIcon,addTrip,switchTrip,addDay,deleteDay,toggleOverviewDay,moveOverviewDay,sortOverviewDaysByDate,stableSortDaysByDate,saveTripEditDraft,startNewCollection,deleteCollection,renderCollectionCard,renderDayCollectionEntries,renderDayNotice,renderCollectionPanel,renderTripSelectorDialog,formatClock,getTripWeekday,formatTripWeekday,formatTripDate,findUnexpectedHorizontalOverflow};`, context);
+vm.runInContext(`${fs.readFileSync("app.js", "utf8")}\n;globalThis.__test={state,migrateTrip,normalizeTripEditDay,makeTripEditDraft,updateTripDraftField,handleTripEditorInput,handleTripEditorCompositionStart,handleTripEditorCompositionEnd,isTripEditing,applyRemotePayload,releasePendingRemoteUpdate,isHttpUrl,normalizeBooking,normalizePhrase,deleteTimelineItem,restoreDeletedTimelineItem,deleteBooking,speakJapanese,stopSpeech,cancelAttachedAdd,phraseCategoryLabel,insertTimelineAbove,renderTimelineItem,renderFlight,renderReference,renderEditModal,renderTripDraftDialog,renderMapActions,renderTools,renderPacking,renderMobileActionSheet,renderPackingDialog,packingGroupIdentity,findPackingGroup,findPackingItem,addPackingGroup,deletePackingGroup,addPackingChild,deletePackingChild,renamePackingGroup,deletePackingItem,buildDirectionsUrl,transportModes,openEditModal,beginTripEdit,cancelEditModal,handleTripDraftChoice,saveEditModal,applyEditValues,saveTrip,stableColorIndex,referenceFallbackIcon,addTrip,switchTrip,addDay,deleteDay,toggleOverviewDay,moveOverviewDay,sortOverviewDaysByDate,stableSortDaysByDate,saveTripEditDraft,startNewCollection,deleteCollection,renderCollectionCard,renderDayCollectionEntries,renderDayNotice,renderCollectionPanel,renderTripSelectorDialog,formatClock,getTripWeekday,formatTripWeekday,formatTripDate,findUnexpectedHorizontalOverflow,readTripEditDraftStore,getStoredTripEditDraft,persistTripEditDraft,scheduleTripEditDraftSave,flushTripEditDraft,deleteStoredTripEditDraft};`, context);
 const api = context.__test;
 
 assert.equal(api.state.root.schemaVersion, 6);
@@ -219,6 +219,7 @@ const formalTitleBeforeCancel = api.state.trip.title;
 api.openEditModal("trip", api.state.trip.id);
 api.state.tripEditDraft.title = "不應保存的草稿";
 api.cancelEditModal();
+api.handleTripDraftChoice({ preventDefault() {}, stopPropagation() {}, currentTarget: { contains: () => true }, target: { dataset: { tripDraftChoice: "discard-and-leave" }, closest: () => ({ dataset: { tripDraftChoice: "discard-and-leave" } }) } });
 assert.equal(api.state.trip.title, formalTitleBeforeCancel);
 assert.equal(store.get("fukuoka-hiroshima-trip-v1"), storedBeforeTripCancel);
 const daysBefore = api.state.trip.days.length;
@@ -517,6 +518,78 @@ const spacingPatch = styles.slice(styles.indexOf("/* v6-ui-14-sync-2"));
 assert.doesNotMatch(spacingPatch, /\.reference-card\.preview-card-shell|\.reference-preview-main|\.reference-copy|\.preview-media|\.card-corner-actions/);
 console.log("PASS packing 項目欄／子項目管理：UUID、數字 0、取消安全、ID 保留、保存與同步排程");
 console.log("PASS 網址卡清單 row-gap 1px，卡片本體樣式未修改");
+
+const appSource = fs.readFileSync("app.js", "utf8");
+const formalBeforeDraft = store.get("fukuoka-hiroshima-trip-v1");
+api.beginTripEdit();
+api.state.syncDirty = false;
+const draftInput = {
+  value: "貼上第一行\n貼上第二行",
+  dataset: { tripField: "notice" },
+  closest(selector) {
+    if (selector.includes("edit-modal-form")) return { tagName: "FORM" };
+    if (selector === "[data-trip-field]") return this;
+    return null;
+  },
+};
+api.handleTripEditorInput({ target: draftInput });
+assert.equal(api.state.tripEditDraft.notice, "貼上第一行\n貼上第二行");
+draftInput.value = "";
+api.handleTripEditorInput({ target: draftInput });
+assert.equal(api.state.tripEditDraft.notice, "");
+api.handleTripEditorCompositionStart({ target: draftInput });
+draftInput.value = "中文輸入完整";
+api.handleTripEditorCompositionEnd({ target: draftInput });
+assert.equal(api.state.tripEditDraft.notice, "中文輸入完整");
+api.state.expandedOverviewDayId = api.state.tripEditDraft.days[0].id;
+api.state.tripEditScrollTop = 137;
+noopElement.scrollTop = 137;
+api.flushTripEditDraft();
+const localDraft = api.getStoredTripEditDraft(api.state.trip.id);
+assert.equal(localDraft.draft.notice, "中文輸入完整");
+assert.equal(String(localDraft.expandedTripDayId), String(api.state.tripEditDraft.days[0].id));
+assert.equal(localDraft.scrollTop, 137);
+assert.equal(store.get("fukuoka-hiroshima-trip-v1"), formalBeforeDraft);
+assert.equal(api.state.syncDirty, false);
+assert.doesNotMatch(JSON.stringify(api.state.root), /travel-app-trip-edit-drafts-v1|savedAt|baseRevision/);
+api.state.editModal = null; api.state.tripEditDraft = null;
+api.openEditModal("trip", api.state.trip.id);
+assert.equal(api.state.tripDraftDialog.type, "restore");
+assert.match(api.renderTripDraftDialog(), /繼續編輯[\s\S]*捨棄草稿[\s\S]*取消/);
+api.beginTripEdit(localDraft);
+assert.equal(api.state.tripEditDraft.notice, "中文輸入完整");
+assert.equal(String(api.state.expandedOverviewDayId), String(localDraft.expandedTripDayId));
+assert.equal(api.state.tripEditScrollTop, 137);
+const anotherTripId = "another-trip";
+const draftStore = api.readTripEditDraftStore();
+draftStore.drafts[anotherTripId] = { tripId: anotherTripId, draft: { id: anotherTripId } };
+context.localStorage.setItem("travel-app-trip-edit-drafts-v1", JSON.stringify(draftStore));
+api.deleteStoredTripEditDraft(api.state.trip.id);
+assert.equal(api.getStoredTripEditDraft(api.state.trip.id), null);
+assert.equal(api.getStoredTripEditDraft(anotherTripId).tripId, anotherTripId);
+api.beginTripEdit();
+api.state.tripEditDraft.notice = "成功保存後移除";
+api.flushTripEditDraft();
+const tripSaveForm = { dataset: { editType: "trip" }, querySelectorAll: () => [] };
+api.saveEditModal({ preventDefault() {}, currentTarget: tripSaveForm });
+assert.equal(api.getStoredTripEditDraft(api.state.trip.id), null);
+api.beginTripEdit();
+api.state.tripEditDraft.notice = "正式保存失敗仍保留";
+api.flushTripEditDraft();
+const normalSetItem = context.localStorage.setItem;
+context.localStorage.setItem = (key, value) => { if (key === "fukuoka-hiroshima-trip-v1") throw new Error("quota"); normalSetItem(key, value); };
+api.saveEditModal({ preventDefault() {}, currentTarget: tripSaveForm });
+context.localStorage.setItem = normalSetItem;
+assert.equal(api.getStoredTripEditDraft(api.state.trip.id).draft.notice, "正式保存失敗仍保留");
+assert.equal(api.state.editModal.type, "trip");
+assert.match(appSource, /setTimeout\(persistTripEditDraft, 300\)/);
+assert.match(appSource, /visibilitychange[\s\S]*flushTripEditDraft\(\)/);
+assert.match(appSource, /addEventListener\("pagehide"[\s\S]*flushTripEditDraft\(\)/);
+assert.match(appSource, /a\[target=\"_blank\"\][\s\S]*flushTripEditDraft\(\)/);
+assert.match(appSource, /addEventListener\("blur", flushTripEditDraft\)/);
+assert.match(appSource, /addEventListener\("beforeunload", flushTripEditDraft\)/);
+assert.doesNotMatch(appSource.match(/function persistTripEditDraft\([\s\S]*?\n}/)?.[0] || "", /saveTrip|scheduleSyncUpload|uploadSync/);
+console.log("PASS 行程草稿：debounce 本機保存、空字串／中文／貼上、正式資料與同步隔離、恢復狀態及指定 trip 刪除");
 
 let spoken = [];
 let cancelled = 0;

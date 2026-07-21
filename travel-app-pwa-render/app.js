@@ -1,5 +1,6 @@
 const STORAGE_KEY = "fukuoka-hiroshima-trip-v1";
 const SYNC_STORAGE_KEY = "travel-app-cloud-sync-v1";
+const TRIP_EDIT_DRAFTS_KEY = "travel-app-trip-edit-drafts-v1";
 const SCHEMA_VERSION = 6;
 const PHRASE_CATEGORIES = ["restaurant", "hotel", "transport", "shopping", "emergency", "general"];
 let storageWarning = "";
@@ -11,6 +12,7 @@ let pwaReloadPending = false;
 let applyingRemote = false;
 let syncUploadTimer = null;
 let syncInFlight = false;
+let tripDraftSaveTimer = null;
 
 const transportModes = [
   { value: "", label: "未設定", icon: "" },
@@ -463,7 +465,9 @@ const state = {
   expandedOverviewDayId: null,
   tripEditScrollTop: 0,
   tripEditComposing: false,
+  tripEditBaseRevision: null,
   pendingRemoteUpdate: null,
+  tripDraftDialog: null,
   installDialogOpen: false,
   pwaUpdateReady: false,
   packingDialog: null,
@@ -490,10 +494,67 @@ if (!modalRoot) {
 });
 modalRoot.addEventListener("submit", handlePackingDialogSubmit);
 modalRoot.addEventListener("input", handleTripEditorInput);
+modalRoot.addEventListener("change", handleTripEditorInput);
 modalRoot.addEventListener("compositionstart", handleTripEditorCompositionStart);
 modalRoot.addEventListener("compositionend", handleTripEditorCompositionEnd);
 modalRoot.addEventListener("click", handleTripEditorMovement);
+modalRoot.addEventListener("click", handleTripDraftChoice);
 app.addEventListener("change", handlePackingChange);
+
+function readTripEditDraftStore() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(TRIP_EDIT_DRAFTS_KEY) || "{}");
+    return parsed && typeof parsed === "object" && parsed.drafts && typeof parsed.drafts === "object" ? parsed : { drafts: {} };
+  } catch { return { drafts: {} }; }
+}
+
+function getStoredTripEditDraft(tripId) {
+  return readTripEditDraftStore().drafts[String(tripId)] || null;
+}
+
+function captureTripEditorSnapshot() {
+  if (!isTripEditing()) return;
+  syncTripDraftFromForm();
+  const body = document.querySelector('#edit-modal-form[data-edit-type="trip"] .modal-body');
+  if (body) state.tripEditScrollTop = body.scrollTop;
+}
+
+function persistTripEditDraft() {
+  if (!isTripEditing()) return false;
+  clearTimeout(tripDraftSaveTimer); tripDraftSaveTimer = null;
+  try {
+    captureTripEditorSnapshot();
+    const store = readTripEditDraftStore();
+    store.drafts[String(state.trip.id)] = {
+      tripId: state.trip.id,
+      draft: structuredClone(state.tripEditDraft),
+      expandedTripDayId: state.expandedOverviewDayId,
+      scrollTop: state.tripEditScrollTop,
+      savedAt: new Date().toISOString(),
+      baseRevision: state.tripEditBaseRevision,
+      baseUpdatedAt: state.syncSettings?.lastSyncedAt ?? null,
+    };
+    localStorage.setItem(TRIP_EDIT_DRAFTS_KEY, JSON.stringify(store));
+    return true;
+  } catch { return false; }
+}
+
+function scheduleTripEditDraftSave() {
+  if (!isTripEditing()) return;
+  clearTimeout(tripDraftSaveTimer);
+  tripDraftSaveTimer = setTimeout(persistTripEditDraft, 300);
+}
+
+function flushTripEditDraft() { return persistTripEditDraft(); }
+
+function deleteStoredTripEditDraft(tripId) {
+  try {
+    const store = readTripEditDraftStore();
+    delete store.drafts[String(tripId)];
+    localStorage.setItem(TRIP_EDIT_DRAFTS_KEY, JSON.stringify(store));
+    return true;
+  } catch { return false; }
+}
 
 function render() {
   commitActiveEdit();
@@ -522,7 +583,7 @@ function render() {
       ${renderSyncStatus()}
     </div>
   `;
-  modalRoot.innerHTML = `${renderModal()}${renderFlightDetailModal()}${renderCollectionDetailModal()}${renderCollectionPanel()}${renderTripSelectorDialog()}${renderEditModal()}${renderMobileActionSheet()}${renderPackingDialog()}${renderInstallDialog()}${renderSyncDialog()}<input type="file" id="trip-backup-input" accept="application/json,.json" hidden />`;
+  modalRoot.innerHTML = `${renderModal()}${renderFlightDetailModal()}${renderCollectionDetailModal()}${renderCollectionPanel()}${renderTripSelectorDialog()}${renderEditModal()}${renderTripDraftDialog()}${renderMobileActionSheet()}${renderPackingDialog()}${renderInstallDialog()}${renderSyncDialog()}<input type="file" id="trip-backup-input" accept="application/json,.json" hidden />`;
   bindEvents();
   openRootDialogs();
   openMobileActionSheet();
@@ -1301,6 +1362,13 @@ function renderEditModal() {
   return `<div class="modal-backdrop" data-cancel-edit><form class="modal edit-modal" id="edit-modal-form" data-edit-type="${type}" data-edit-id="${escapeAttr(id)}"><div class="modal-header"><h2>${title}</h2><button class="secondary-button" type="button" data-cancel-edit>取消</button></div><div class="modal-body edit-form-grid">${fields}${preview}<div class="form-actions"><button class="primary-button" type="submit">儲存修改</button><button class="secondary-button" type="button" data-cancel-edit>取消</button></div></div></form></div>`;
 }
 
+function renderTripDraftDialog() {
+  const dialog = state.tripDraftDialog;
+  if (!dialog) return "";
+  if (dialog.type === "restore") return `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="trip-draft-dialog-title"><div class="modal-header"><h2 id="trip-draft-dialog-title">找到尚未完成的行程編輯草稿</h2></div><div class="modal-body"><div class="form-actions"><button class="primary-button" type="button" data-trip-draft-choice="continue-restore">繼續編輯</button><button class="danger-button" type="button" data-trip-draft-choice="discard-restore">捨棄草稿</button><button class="secondary-button" type="button" data-trip-draft-choice="cancel-restore">取消</button></div></div></section></div>`;
+  return `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="trip-draft-dialog-title"><div class="modal-header"><h2 id="trip-draft-dialog-title">要保留尚未完成的編輯草稿嗎？</h2></div><div class="modal-body"><div class="form-actions"><button class="primary-button" type="button" data-trip-draft-choice="keep-and-leave">保留草稿並離開</button><button class="danger-button" type="button" data-trip-draft-choice="discard-and-leave">捨棄草稿</button><button class="secondary-button" type="button" data-trip-draft-choice="continue-editing">繼續編輯</button></div></div></section></div>`;
+}
+
 function editAssignmentSelect(type, item, day) {
   return `<label>所屬行程<select class="text-input" data-edit-field="timelineItemId"><option value="">未指定行程</option>${day.timeline.map((timeline) => `<option value="${escapeAttr(timeline.id)}" ${timeline.id === item.timelineItemId ? "selected" : ""}>${escapeHtml(timeline.time)} ${escapeHtml(timeline.title)}</option>`).join("")}</select></label>`;
 }
@@ -1849,7 +1917,7 @@ function deleteCurrentTrip() {
 function addDay() {
   if (state.editModal?.type === "trip" && state.tripEditDraft) {
     syncTripDraftFromForm();
-    const day = makeBlankDay(); state.tripEditDraft.days.push(day); state.expandedOverviewDayId = day.id; render(); return;
+    const day = makeBlankDay(); state.tripEditDraft.days.push(day); state.expandedOverviewDayId = day.id; scheduleTripEditDraftSave(); render(); return;
   }
   const day = makeBlankDay(); state.trip.days.push(day); state.selectedDayId = day.id; saveTrip(); render();
 }
@@ -1866,7 +1934,7 @@ function deleteDay(id) {
   if (!confirm(`確定刪除此日期？關聯資料：${detail}。`)) return;
   days.splice(index, 1); setUndoDelete({ type: draftMode ? "day-draft" : "day", tripId: state.trip.id, index, item: day, label: day.title || "日期" });
   if (!days.length) days.push(makeBlankDay());
-  if (draftMode) { state.expandedOverviewDayId = null; render(); return; }
+  if (draftMode) { state.expandedOverviewDayId = null; scheduleTripEditDraftSave(); render(); return; }
   state.selectedDayId = days[Math.min(index, days.length - 1)].id; saveTrip(); render();
 }
 
@@ -1877,6 +1945,7 @@ function toggleOverviewDay(id) {
   const day = state.tripEditDraft?.days.find((entry) => String(entry.id) === String(id));
   if (!day) { showTripDayEditError("找不到這筆日期資料，請關閉後重新開啟旅行編輯。"); return; }
   state.expandedOverviewDayId = String(state.expandedOverviewDayId) === String(day.id) ? null : day.id;
+  scheduleTripEditDraftSave();
   render();
   requestAnimationFrame(() => {
     const nextBody = document.querySelector('#edit-modal-form[data-edit-type="trip"] .modal-body');
@@ -1916,6 +1985,7 @@ function handleTripEditorInput(event) {
     const weekday = dayField.closest("label")?.querySelector("[data-date-weekday]");
     if (weekday) weekday.textContent = formatTripWeekday(dayField.value);
   }
+  if (!state.tripEditComposing) scheduleTripEditDraftSave();
 }
 
 function handleTripEditorCompositionStart(event) {
@@ -1926,6 +1996,7 @@ function handleTripEditorCompositionEnd(event) {
   if (!event.target.closest?.('#edit-modal-form[data-edit-type="trip"]')) return;
   state.tripEditComposing = false;
   handleTripEditorInput(event);
+  scheduleTripEditDraftSave();
 }
 
 function handleTripEditorMovement(event) {
@@ -1954,6 +2025,7 @@ function moveOverviewDay(id, direction) {
   state.tripEditScrollTop = modalBody?.scrollTop ?? state.tripEditScrollTop;
   const [day] = days.splice(from, 1);
   days.splice(to, 0, day);
+  scheduleTripEditDraftSave();
   render();
   requestAnimationFrame(() => {
     const nextBody = document.querySelector('#edit-modal-form[data-edit-type="trip"] .modal-body');
@@ -1968,6 +2040,7 @@ function sortOverviewDaysByDate() {
   syncTripDraftFromForm();
   if (!state.tripEditDraft) return;
   state.tripEditDraft.days = stableSortDaysByDate(state.tripEditDraft.days);
+  scheduleTripEditDraftSave();
   render();
 }
 
@@ -2009,7 +2082,7 @@ function bindOverviewDragHandles() {
       if (source && target.parentNode) target.parentNode.insertBefore(source, from < to ? target.nextSibling : target);
       document.querySelectorAll("[data-overview-day-id]").forEach((row, index) => { const label = row.querySelector(".overview-summary-copy b"); if (label) label.textContent = `D${index + 1}`; });
     });
-    const finish = (event) => { stop(); if (active) { event.preventDefault(); active = false; handle.closest(".overview-accordion")?.classList.remove("dragging"); render(); } };
+    const finish = (event) => { stop(); if (active) { event.preventDefault(); active = false; handle.closest(".overview-accordion")?.classList.remove("dragging"); scheduleTripEditDraftSave(); render(); } };
     handle.addEventListener("pointerup", finish); handle.addEventListener("pointercancel", finish); handle.addEventListener("lostpointercapture", finish);
   });
 }
@@ -2141,14 +2214,36 @@ function cancelAttachedAdd() {
   render();
 }
 
+function beginTripEdit(saved = null) {
+  state.tripEditDraft = saved ? structuredClone(saved.draft) : makeTripEditDraft(state.trip);
+  state.expandedOverviewDayId = saved?.expandedTripDayId ?? null;
+  state.tripEditScrollTop = Number(saved?.scrollTop) || 0;
+  state.tripEditBaseRevision = saved?.baseRevision ?? state.syncSettings?.revision ?? null;
+  state.editModal = { type: "trip", id: state.trip.id };
+  state.tripDraftDialog = null;
+  render();
+  requestAnimationFrame(() => { const body = document.querySelector('#edit-modal-form[data-edit-type="trip"] .modal-body'); if (body) body.scrollTop = state.tripEditScrollTop; });
+}
+
 function openEditModal(type, id) {
-  if (type === "trip") { state.tripEditDraft = makeTripEditDraft(state.trip); state.expandedOverviewDayId = null; state.tripEditScrollTop = 0; }
+  if (type === "trip") {
+    const saved = getStoredTripEditDraft(state.trip.id);
+    state.openMenuId = null;
+    if (saved?.draft) { state.tripDraftDialog = { type: "restore", tripId: state.trip.id, saved }; render(); return; }
+    beginTripEdit(); return;
+  }
   state.editModal = { type, id };
   state.openMenuId = null;
   render();
 }
 
 function cancelEditModal() {
+  if (isTripEditing()) {
+    flushTripEditDraft();
+    state.tripDraftDialog = { type: "cancel", tripId: state.trip.id };
+    render();
+    return;
+  }
   if (state.editModal?.isNew && ["lodging", "dining"].includes(state.editModal.type)) {
     const list = state.editModal.type === "lodging" ? getSelectedDay().lodgings : getSelectedDay().dining;
     const index = list.findIndex((item) => item.id === state.editModal.id);
@@ -2159,8 +2254,40 @@ function cancelEditModal() {
   state.expandedOverviewDayId = null;
   state.tripEditScrollTop = 0;
   state.tripEditComposing = false;
+  state.tripEditBaseRevision = null;
   releasePendingRemoteUpdate();
   render();
+}
+
+function closeTripEditor() {
+  clearTimeout(tripDraftSaveTimer); tripDraftSaveTimer = null;
+  state.editModal = null;
+  state.tripEditDraft = null;
+  state.expandedOverviewDayId = null;
+  state.tripEditScrollTop = 0;
+  state.tripEditComposing = false;
+  state.tripEditBaseRevision = null;
+  state.tripDraftDialog = null;
+  releasePendingRemoteUpdate();
+  render();
+}
+
+function handleTripDraftChoice(event) {
+  const button = event.target.closest?.("[data-trip-draft-choice]");
+  if (!button || !event.currentTarget.contains(button)) return;
+  event.preventDefault(); event.stopPropagation();
+  const dialog = state.tripDraftDialog;
+  if (!dialog) return;
+  const choice = button.dataset.tripDraftChoice;
+  if (choice === "continue-restore") { beginTripEdit(dialog.saved); return; }
+  if (choice === "discard-restore") { deleteStoredTripEditDraft(dialog.tripId); beginTripEdit(); return; }
+  if (choice === "cancel-restore") { state.tripDraftDialog = null; render(); return; }
+  if (choice === "keep-and-leave") { flushTripEditDraft(); closeTripEditor(); return; }
+  if (choice === "discard-and-leave") { deleteStoredTripEditDraft(dialog.tripId); closeTripEditor(); return; }
+  if (choice === "continue-editing") {
+    state.tripDraftDialog = null; render();
+    requestAnimationFrame(() => { const body = document.querySelector('#edit-modal-form[data-edit-type="trip"] .modal-body'); if (body) body.scrollTop = state.tripEditScrollTop; });
+  }
 }
 
 function saveEditModal(event) {
@@ -2168,19 +2295,40 @@ function saveEditModal(event) {
   const form = event.currentTarget;
   const values = {};
   let saved;
+  const formalTripBeforeSave = form.dataset.editType === "trip" ? structuredClone(state.trip) : null;
+  const remoteRootBeforeSave = form.dataset.editType === "trip" ? structuredClone(state.root) : null;
+  const draftBaseRevision = state.tripEditBaseRevision;
   if (form.dataset.editType === "trip") {
     syncTripDraftFromForm();
+    flushTripEditDraft();
     saved = saveTripEditDraft({});
   } else {
     form.querySelectorAll("[data-edit-field]").forEach((field) => { values[field.dataset.editField] = field.value.trim(); });
     saved = applyEditValues(form.dataset.editType, form.dataset.editId, values);
   }
   if (saved) {
+    const savedTripId = form.dataset.editType === "trip" ? state.trip.id : null;
+    try { saveTrip(); }
+    catch {
+      if (formalTripBeforeSave) {
+        const index = state.root.trips.findIndex((trip) => String(trip.id) === String(formalTripBeforeSave.id));
+        if (index !== -1) state.root.trips[index] = formalTripBeforeSave;
+        state.trip = formalTripBeforeSave;
+      }
+      alert("儲存失敗，已保留行程編輯草稿，請稍後再試。"); return;
+    }
     state.editModal = null;
     state.tripEditDraft = null;
     state.expandedOverviewDayId = null;
     state.tripEditScrollTop = 0;
-    saveTrip();
+    state.tripEditBaseRevision = null;
+    if (savedTripId !== null) deleteStoredTripEditDraft(savedTripId);
+    if (savedTripId !== null && draftBaseRevision !== null && state.syncSettings?.revision > draftBaseRevision) {
+      clearTimeout(syncUploadTimer); syncUploadTimer = null;
+      state.syncConflict = { remoteRevision: state.syncSettings.revision, remotePayload: remoteRootBeforeSave, updatedAt: state.syncSettings.lastSyncedAt };
+      state.syncStatus = "conflict";
+      state.syncDirty = true;
+    }
     releasePendingRemoteUpdate();
     render();
   }
@@ -2693,10 +2841,16 @@ globalThis.addEventListener?.("appinstalled", () => {
   render();
 });
 
-document.addEventListener("visibilitychange", () => { if (document.hidden) stopSpeech(); else syncNow(); });
+document.addEventListener("click", (event) => {
+  const link = event.target.closest?.('a[target="_blank"]');
+  if (link && !event.defaultPrevented) flushTripEditDraft();
+}, true);
+document.addEventListener("visibilitychange", () => { if (document.hidden) { flushTripEditDraft(); stopSpeech(); } else syncNow(); });
 window.addEventListener("focus", syncNow);
+window.addEventListener("blur", flushTripEditDraft);
 window.addEventListener("online", syncNow);
-window.addEventListener("pagehide", stopSpeech);
+window.addEventListener("pagehide", () => { flushTripEditDraft(); stopSpeech(); });
+window.addEventListener("beforeunload", flushTripEditDraft);
 function updateVisualViewportHeight() { if (globalThis.visualViewport && document.documentElement) document.documentElement.style.setProperty("--visual-viewport-height", `${visualViewport.height}px`); }
 globalThis.visualViewport?.addEventListener("resize", updateVisualViewportHeight);
 updateVisualViewportHeight();
